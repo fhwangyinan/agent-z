@@ -22,6 +22,7 @@ from rich.text import Text
 AUTO_MODE = False
 TOTAL_LOOPS = 0
 CURRENT_LOOP = 0
+FORCE_DEVELOP = False
 from rich.align import Align
 
 from agents.base import log, step, done, warn, error, run_cmd, PROJECT_DIR, GITHUB_REPO, agent_status
@@ -224,8 +225,8 @@ def main():
             impact, risk = analyst.assess_impact(issue_number, continue_session=True)
             console.print(Panel(impact[:2500], title=f"影响评估 [yellow]风险: {risk}[/yellow]", border_style="yellow"))
 
-            if AUTO_MODE:
-                if risk in ("medium", "high", "very_high"):
+            if AUTO_MODE and not FORCE_DEVELOP:
+                if risk in ("high", "very_high"):
                     warn(f"风险 [{risk}]，自动跳过 → 换下一个 issue")
                     continue
             else:
@@ -331,12 +332,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Multi-Agent 自动 Issue 修复")
     parser.add_argument("--loop", type=int, default=0, metavar="N",
                         help="自动模式：跑 N 轮，跳过所有确认")
+    parser.add_argument("--force", action="store_true",
+                        help="即便高风险也继续开发（需配合 --loop）")
     args = parser.parse_args()
 
     if args.loop > 0:
         AUTO_MODE = True
         TOTAL_LOOPS = args.loop
+        FORCE_DEVELOP = args.force
         console.print(f"[bold cyan]自动模式[/bold cyan] [dim]共 {TOTAL_LOOPS} 轮[/dim]")
+        if FORCE_DEVELOP:
+            console.print("[yellow]⚠ 强制模式：忽略风险级别[/yellow]")
         for i in range(TOTAL_LOOPS):
             CURRENT_LOOP = i + 1
             main()

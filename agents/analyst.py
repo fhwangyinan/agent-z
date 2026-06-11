@@ -40,7 +40,9 @@ class AnalystAgent(Agent):
             f" 3.是否涉及安全/权限/数据一致性  4.受影响的模块和下游依赖  5.潜在风险。"
             f"评估后给出风险等级："
             f"very_low（无影响）、low（轻微影响）、medium（中等影响）、high（显著影响，如行为/API变化）、very_high（破坏性变更，改变现有流程或输出结果）。"
-            f"用英文撰写评估报告，用 gh issue comment {issue_number} 将报告写入 issue comment。"
+            f"用英文撰写评估报告。"
+            f"先用 gh issue view {issue_number} --comments 检查是否已有 Impact Assessment 评论，"
+            f"若无则用 gh issue comment {issue_number} 新增，若有则在已有评论下回复补充更新。"
             f"最后一行输出 RISK=<风险等级>"
         )
         output = self.run(prompt, timeout=TIMEOUT_ANALYST, continue_session=continue_session)
