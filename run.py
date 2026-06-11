@@ -219,6 +219,32 @@ def main():
                 log("跳过，下一轮")
                 continue
 
+            # 影响评估
+            step("🔍 影响评估")
+            impact, risk = analyst.assess_impact(issue_number, continue_session=True)
+            console.print(Panel(impact[:2500], title=f"影响评估 [yellow]风险: {risk}[/yellow]", border_style="yellow"))
+
+            if AUTO_MODE:
+                if risk in ("medium", "high", "very_high"):
+                    warn(f"风险 [{risk}]，自动跳过 → 换下一个 issue")
+                    continue
+            else:
+                console.print("\n[dim]风险等级: [bold]{0}[/bold]  有疑问可输入问题，空回车继续[/dim]".format(risk))
+                while True:
+                    q = Prompt.ask("", default="").strip()
+                    if not q:
+                        break
+                    if q.lower() in ("skip", "s"):
+                        log("用户跳过 → 换下一个 issue")
+                        issue_number = None
+                        break
+                    if q.lower() in ("done", "ok", "go", "y"):
+                        break
+                    answer = analyst.chat(q)
+                    console.print(Panel(answer[:2000], border_style="dim"))
+                if issue_number is None:
+                    continue
+
             # Developer
             step("🔧 Developer 修复")
             developer.fix(issue_number, continue_session=True)

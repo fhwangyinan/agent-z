@@ -31,3 +31,24 @@ class AnalystAgent(Agent):
         if issue_number is None and target_issue:
             issue_number = target_issue
         return issue_number, output
+
+    def assess_impact(self, issue_number: int, continue_session: bool = False) -> tuple[str, str]:
+        """评估 fix 对项目的潜在影响，返回 (impact_report, risk_level)"""
+        prompt = (
+            f"在修复 Issue #{issue_number} 之前，先评估此修复对项目 {PROJECT_DIR} 的潜在影响。"
+            f"重点关注：1.是否改变现有流程或用户行为  2.是否影响 API/接口/输出格式（破坏性变更）"
+            f" 3.是否涉及安全/权限/数据一致性  4.受影响的模块和下游依赖  5.潜在风险。"
+            f"评估后给出风险等级："
+            f"very_low（无影响）、low（轻微影响）、medium（中等影响）、high（显著影响，如行为/API变化）、very_high（破坏性变更，改变现有流程或输出结果）。"
+            f"用英文撰写评估报告，用 gh issue comment {issue_number} 将报告写入 issue comment。"
+            f"最后一行输出 RISK=<风险等级>"
+        )
+        output = self.run(prompt, timeout=TIMEOUT_ANALYST, continue_session=continue_session)
+
+        risk = self.extract(output, r"RISK=(\S+)") or "unknown"
+        risk = risk.lower().strip()
+        return output, risk
+
+    def chat(self, question: str) -> str:
+        """交互问答，继续当前 session"""
+        return self.run(question, timeout=TIMEOUT_ANALYST, continue_session=True)
