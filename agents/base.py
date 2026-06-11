@@ -12,15 +12,12 @@ from rich.console import Console
 from rich.markup import escape
 
 from .runners import ClaudeRunner, AgentRunner
+from config import PROJECT_DIR, GITHUB_REPO, CLAUDE_FLAGS, RETRY_TIMEOUT
 
 console = Console()
 
-# 项目全局配置
-PROJECT_DIR = r"G:\Code\workspace_aieng"
-GITHUB_REPO = "armpro24-blip/cad-cae-copilot"
-
 # 默认 Runner（切换其他 Agent 只需替换这里）
-DEFAULT_RUNNER = ClaudeRunner()
+DEFAULT_RUNNER = ClaudeRunner(flags=CLAUDE_FLAGS, retry_timeout=RETRY_TIMEOUT)
 
 AGENT_ICONS = {
     "Analyst":   "A",

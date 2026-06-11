@@ -6,9 +6,10 @@ from .base import AgentRunner
 class ClaudeRunner(AgentRunner):
     """Claude Code 执行器：通过 claude -p 调用"""
 
-    def __init__(self, flags: list[str] | None = None):
+    def __init__(self, flags: list[str] | None = None, retry_timeout: int = 3600):
         self.cmd = shutil.which("claude") or "claude"
         self.flags = flags or ["--dangerously-skip-permissions"]
+        self.retry_timeout = retry_timeout
 
     def execute(
         self,
@@ -41,7 +42,7 @@ class ClaudeRunner(AgentRunner):
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
-                    timeout=3600,
+                    timeout=self.retry_timeout,
                 )
             except subprocess.TimeoutExpired:
                 raise RuntimeError("Agent timed out after retry")
@@ -56,7 +57,7 @@ class ClaudeRunner(AgentRunner):
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
-                    timeout=3600,
+                    timeout=self.retry_timeout,
                 )
             except subprocess.TimeoutExpired:
                 raise RuntimeError("Agent failed after retry")

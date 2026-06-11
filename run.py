@@ -32,10 +32,12 @@ from agents.submitter import SubmitterAgent
 
 console = Console()
 
-CODERABBIT_POLL_INTERVAL = 45
-CODERABBIT_MAX_WAIT = 900
-MAX_REVIEW_ROUNDS = 5
-MAX_LOCAL_REVIEW_ROUNDS = 5
+from config import (
+    CODERABBIT_POLL_INTERVAL,
+    CODERABBIT_MAX_WAIT,
+    MAX_REVIEW_ROUNDS,
+    MAX_LOCAL_REVIEW_ROUNDS,
+)
 
 
 def show_banner():

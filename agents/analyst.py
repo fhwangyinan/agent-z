@@ -1,4 +1,5 @@
 from .base import Agent, PROJECT_DIR, GITHUB_REPO
+from config import TIMEOUT_ANALYST
 
 
 class AnalystAgent(Agent):
@@ -19,10 +20,11 @@ class AnalystAgent(Agent):
             prompt = (
                 f"项目路径: {PROJECT_DIR} GitHub 仓库: {GITHUB_REPO} "
                 f"用 gh issue list --state open 获取 open issues，用 gh pr list --state open 获取已有 PR，检查是否已有关联 PR（含未 merge 的），排除这些已有PR的issue。"
+                f"查看issue详情和任何相关 issue。"
                 f"只读剩余 issue 关联的关键文件判断是否仍适用或已过时，"
                 f"排除无意义 issue 后推荐最优先修复的一个，并评估修复方案。最后一行输出 RECOMMENDED_ISSUE=<数字>"
             )
-        output = self.run(prompt, timeout=3600, continue_session=continue_session)
+        output = self.run(prompt, timeout=TIMEOUT_ANALYST, continue_session=continue_session)
         issue_number = self.extract_number(output, r"RECOMMENDED_ISSUE=(\d+)")
         if issue_number is None:
             issue_number = self.extract_number(output, r"#(\d+)")
