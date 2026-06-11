@@ -229,7 +229,7 @@ def main():
                     warn(f"风险 [{risk}]，自动跳过 → 换下一个 issue")
                     continue
             else:
-                console.print("\n[dim]风险等级: [bold]{0}[/bold]  有疑问可输入问题，空回车继续[/dim]".format(risk))
+                console.print("\n[dim]风险: [bold]{0}[/bold]  |  输入问题追问  |  [bold]skip[/bold] 换 issue  |  [bold]done[/bold]/回车 开始开发[/dim]".format(risk))
                 while True:
                     q = Prompt.ask("", default="").strip()
                     if not q:
