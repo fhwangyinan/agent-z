@@ -1,8 +1,5 @@
 # Agent 基础类
-import json
-import os
 import re
-import shutil
 import subprocess
 import sys
 from contextlib import contextmanager
@@ -56,6 +53,11 @@ def error(msg: str):
     console.print(f"  [red]x[/red] {escape(msg)}")
 
 
+def _short_output(text: str | None, limit: int = 1000) -> str:
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[:limit] + "..."
+
+
 def run_cmd(cmd, cwd=PROJECT_DIR, check=True, capture_output=True, shell=False, timeout=None, verbose=False):
     if isinstance(cmd, str):
         cmd = [cmd]
@@ -71,7 +73,9 @@ def run_cmd(cmd, cwd=PROJECT_DIR, check=True, capture_output=True, shell=False, 
         if result.stderr:
             print(result.stderr, file=sys.stderr)
     if check and result.returncode != 0:
-        raise RuntimeError(f"cmd failed: {' '.join(cmd)} rc={result.returncode}")
+        details = _short_output(result.stderr) or _short_output(result.stdout)
+        suffix = f"\n{details}" if details else ""
+        raise RuntimeError(f"cmd failed: {' '.join(cmd)} (exit {result.returncode}){suffix}")
     return result
 
 

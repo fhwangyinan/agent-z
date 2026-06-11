@@ -2,6 +2,7 @@
 # .env 不做版本管理，参见 .env.example
 
 import os
+import shlex
 
 _BASE = os.path.dirname(os.path.abspath(__file__))
 
@@ -31,9 +32,21 @@ def _get(key: str, default: str = "") -> str:
     return os.environ.get(key, default)
 
 
-def _get_int(key: str, default: int) -> int:
-    v = os.environ.get(key)
-    return int(v) if v else default
+def _get_positive_int(key: str, default: int, fallback_key: str | None = None) -> int:
+    raw = os.environ.get(key)
+    source = key
+    if not raw and fallback_key:
+        raw = os.environ.get(fallback_key)
+        source = fallback_key
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{source} must be a positive integer, got {raw!r}") from exc
+    if value <= 0:
+        raise ValueError(f"{source} must be a positive integer, got {raw!r}")
+    return value
 
 
 # ---- 项目配置 ----
@@ -41,17 +54,22 @@ PROJECT_DIR = _get("PROJECT_DIR", r"G:\Code\workspace_aieng")
 GITHUB_REPO = _get("GITHUB_REPO", "armpro24-blip/cad-cae-copilot")
 
 # ---- Claude Runner 配置 ----
-CLAUDE_FLAGS = _get("CLAUDE_FLAGS", "--dangerously-skip-permissions").split()
+CLAUDE_FLAGS = shlex.split(_get("CLAUDE_FLAGS", "--dangerously-skip-permissions"))
 
 # ---- 超时配置 (秒) ----
-TIMEOUT_ANALYST = _get_int("TIMEOUT_ANALYST", 3600)
-TIMEOUT_DEVELOPER = _get_int("TIMEOUT_DEVELOPER", 10800)
-TIMEOUT_REVIEWER = _get_int("TIMEOUT_REVIEWER", 1800)
-TIMEOUT_SUBMITTER = _get_int("TIMEOUT_SUBMITTER", 600)
-RETRY_TIMEOUT = _get_int("RETRY_TIMEOUT", 3600)
+TIMEOUT_ANALYST = _get_positive_int("TIMEOUT_ANALYST", 3600)
+TIMEOUT_DEVELOPER = _get_positive_int("TIMEOUT_DEVELOPER", 10800)
+TIMEOUT_REVIEWER = _get_positive_int("TIMEOUT_REVIEWER", 1800)
+TIMEOUT_SUBMITTER = _get_positive_int("TIMEOUT_SUBMITTER", 600)
+RETRY_TIMEOUT = _get_positive_int("RETRY_TIMEOUT", 3600)
 
-# ---- CodeRabbit 配置 ----
-CODERABBIT_POLL_INTERVAL = _get_int("CODERABBIT_POLL_INTERVAL", 45)
-CODERABBIT_MAX_WAIT = _get_int("CODERABBIT_MAX_WAIT", 900)
-MAX_REVIEW_ROUNDS = _get_int("MAX_REVIEW_ROUNDS", 5)
-MAX_LOCAL_REVIEW_ROUNDS = _get_int("MAX_LOCAL_REVIEW_ROUNDS", 5)
+# ---- PR Checks 配置 ----
+# 旧的 CODERABBIT_* 名称保留为兼容回退。
+PR_CHECKS_INTERVAL = _get_positive_int(
+    "PR_CHECKS_INTERVAL", 10, fallback_key="CODERABBIT_POLL_INTERVAL"
+)
+PR_CHECKS_MAX_WAIT = _get_positive_int(
+    "PR_CHECKS_MAX_WAIT", 900, fallback_key="CODERABBIT_MAX_WAIT"
+)
+MAX_REVIEW_ROUNDS = _get_positive_int("MAX_REVIEW_ROUNDS", 5)
+MAX_LOCAL_REVIEW_ROUNDS = _get_positive_int("MAX_LOCAL_REVIEW_ROUNDS", 5)

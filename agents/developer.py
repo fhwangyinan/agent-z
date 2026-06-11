@@ -13,9 +13,10 @@ class DeveloperAgent(Agent):
     def apply_review(self, issue_number: int, pr_url: str, continue_session: bool = False) -> str:
         if pr_url:
             prompt = (
-                f"PR {pr_url} 有新的 CodeRabbitAI Code Review，用 gh pr view --comments 读取完整 review。"
-                f"如果 review 已认可且无需修改，直接输出 NO_ACTION_NEEDED。"
-                f"如果 review 有修改意见，修改代码并本地提交，但先不要 push"
+                f"PR {pr_url} 的 checks 已完成。用 gh pr checks 和 gh pr view --comments "
+                f"读取失败的 CI checks 与完整 review。"
+                f"如果 checks 全部通过且 review 无需修改，直接输出 NO_ACTION_NEEDED。"
+                f"如果有可执行反馈，修改代码并本地提交，但先不要 push"
             )
         else:
             prompt = "根据 Reviewer 的本地 review 意见修改代码并提交"

@@ -4,10 +4,10 @@
 
 Lightweight coding-agent-driven automation for autonomous development loops.
 
-Agent-Z orchestrates multiple specialized agents powered by Claude Code, forming a fully autonomous cycle: pick issue → assess impact → fix code → review locally → open PR → iterate on CI feedback.
+Agent-Z orchestrates multiple specialized agents powered by Claude Code, forming a fully autonomous cycle: pick issue → assess impact → fix code → review locally → open PR → wait for and iterate on PR checks.
 
 ```
-Analyst → Impact Assessment → Developer → Reviewer → Submitter → CodeRabbit → Developer → ...
+Analyst → Impact Assessment → Developer → Reviewer → Submitter → PR Checks → Developer → ...
 ```
 
 ## Prerequisites
@@ -15,7 +15,7 @@ Analyst → Impact Assessment → Developer → Reviewer → Submitter → CodeR
 - Python 3.11+
 - [GitHub CLI](https://cli.github.com/) (`gh`) authenticated
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`) installed
-- [CodeRabbitAI](https://coderabbit.ai/) GitHub App on target repo
+- Optional: [CodeRabbitAI](https://coderabbit.ai/) GitHub App on target repo
 
 ## Setup
 
@@ -68,7 +68,7 @@ Each round:
 4. **Develop** — Fix code (shares session with Analyst via `--continue`)
 5. **Review** — Local code review (git diff + tests); Developer fixes feedback
 6. **Submit** — Branch, commit, push, open PR
-7. **CodeRabbit** — Wait for check → Developer reads review → fix → local Reviewer validates → push + @coderabbitai → repeat until approved or `NO_ACTION_NEEDED`
+7. **PR Checks** — Wait for all checks with `gh pr checks --watch` → Developer reads CI and review feedback → fixes → local Reviewer validates → push → repeat until no action is needed
 
 ## Architecture
 
@@ -102,10 +102,12 @@ Copy `.env.example` to `.env` and edit. Full options:
 | `TIMEOUT_REVIEWER` | Reviewer timeout (s) | 1800 |
 | `TIMEOUT_SUBMITTER` | Submitter timeout (s) | 600 |
 | `RETRY_TIMEOUT` | Retry timeout (s) | 3600 |
-| `CODERABBIT_POLL_INTERVAL` | Poll interval (s) | 45 |
-| `CODERABBIT_MAX_WAIT` | Max wait for CodeRabbit (s) | 900 |
+| `PR_CHECKS_INTERVAL` | PR checks watch interval (s) | 10 |
+| `PR_CHECKS_MAX_WAIT` | Max wait for PR checks (s) | 900 |
 | `MAX_REVIEW_ROUNDS` | Max review-fix loops | 5 |
 | `MAX_LOCAL_REVIEW_ROUNDS` | Max local review loops | 5 |
+
+Legacy variables `CODERABBIT_POLL_INTERVAL` and `CODERABBIT_MAX_WAIT` remain supported as fallbacks.
 
 ## Custom Agent Backend
 

@@ -4,10 +4,10 @@
 
 轻量级 coding-agent 驱动脚本，实现自主开发循环。
 
-通过 Claude Code 驱动多个专项 Agent，构成全自动闭环：挑选 issue → 影响评估 → 修复代码 → 本地审查 → 提 PR → 迭代 CI 反馈。
+通过 Claude Code 驱动多个专项 Agent，构成全自动闭环：挑选 issue → 影响评估 → 修复代码 → 本地审查 → 提 PR → 等待并迭代 PR Checks 反馈。
 
 ```
-Analyst → 影响评估 → Developer → Reviewer → Submitter → CodeRabbit → Developer → ...
+Analyst → 影响评估 → Developer → Reviewer → Submitter → PR Checks → Developer → ...
 ```
 
 ## 前置条件
@@ -15,7 +15,7 @@ Analyst → 影响评估 → Developer → Reviewer → Submitter → CodeRabbit
 - Python 3.11+
 - [GitHub CLI](https://cli.github.com/) (`gh`) 已认证
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`) 已安装
-- 目标仓库已安装 [CodeRabbitAI](https://coderabbit.ai/) GitHub App
+- 可选：目标仓库安装 [CodeRabbitAI](https://coderabbit.ai/) GitHub App
 
 ## 安装
 
@@ -68,7 +68,7 @@ python run.py --loop 5 --force      # 自主模式：忽略风险级别，全部
 4. **开发修复** — 修复代码（通过 `--continue` 复用 Analyst 上下文）
 5. **本地审查** — 本地 Code Review (git diff + 测试)；Developer 修复反馈
 6. **提交 PR** — 创建分支、commit、push、创建 PR
-7. **CodeRabbit** — 等待 check → Developer 读取 review → 修复 → 本地 Reviewer 复查通过 → push + @coderabbitai → 循环直到通过或 `NO_ACTION_NEEDED`
+7. **PR Checks** — 使用 `gh pr checks --watch` 等待全部 checks → Developer 读取 CI 与 review 反馈 → 修复 → 本地 Reviewer 复查通过 → push → 循环直到无需修改
 
 ## 架构
 
@@ -102,10 +102,12 @@ agents/
 | `TIMEOUT_REVIEWER` | Reviewer 超时 (秒) | 1800 |
 | `TIMEOUT_SUBMITTER` | Submitter 超时 (秒) | 600 |
 | `RETRY_TIMEOUT` | 重试超时 (秒) | 3600 |
-| `CODERABBIT_POLL_INTERVAL` | 轮询间隔 (秒) | 45 |
-| `CODERABBIT_MAX_WAIT` | CodeRabbit 最大等待 (秒) | 900 |
+| `PR_CHECKS_INTERVAL` | PR Checks watch 间隔 (秒) | 10 |
+| `PR_CHECKS_MAX_WAIT` | PR Checks 最大等待 (秒) | 900 |
 | `MAX_REVIEW_ROUNDS` | Review 最大轮次 | 5 |
 | `MAX_LOCAL_REVIEW_ROUNDS` | 本地 Review 最大轮次 | 5 |
+
+旧变量 `CODERABBIT_POLL_INTERVAL` 和 `CODERABBIT_MAX_WAIT` 仍可作为兼容回退。
 
 ## 自定义 Agent 后端
 
