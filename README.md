@@ -1,110 +1,88 @@
-# Agent-Z — Multi-Agent GitHub Issue Auto-Fix
+# Agent-Z
 
-Multi-Agent 自动化脚本，使用 Claude Code 驱动多个专项 Agent，自动分析、修复 GitHub Issue，创建 PR，配合 CodeRabbitAI Review 迭代修复。
+[中文文档](README.zh.md)
+
+Lightweight coding-agent-driven automation for autonomous development loops.
+
+Agent-Z orchestrates multiple specialized agents (analyst, developer, reviewer, submitter) powered by Claude Code, forming a fully autonomous cycle: analyze issues → fix code → review locally → open PR → iterate on CI feedback.
 
 ```
-Analyst → Developer → Reviewer → Submitter → CodeRabbit → Developer
+Analyst → Developer → Reviewer → Submitter → CodeRabbit → Developer → ...
 ```
 
-## 前置条件
+## Prerequisites
 
 - Python 3.11+
-- [GitHub CLI](https://cli.github.com/) (`gh`) 已认证
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`) 已安装并配置
-- 目标仓库已安装 [CodeRabbitAI](https://coderabbit.ai/) GitHub App
+- [GitHub CLI](https://cli.github.com/) (`gh`) authenticated
+- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`) installed
+- [CodeRabbitAI](https://coderabbit.ai/) GitHub App on target repo
 
-## 安装
+## Setup
 
 ```bash
-# 创建虚拟环境
 python -m venv .venv
-
-# 激活虚拟环境 (Windows)
-.venv\Scripts\activate
-
-# 激活虚拟环境 (Linux/macOS)
-source .venv/bin/activate
-
-# 安装依赖
+.venv\Scripts\activate      # Windows
+source .venv/bin/activate   # Linux/macOS
 pip install -r requirements.txt
+cp .env.example .env        # edit with your settings
 ```
 
-## 配置
+## Usage
 
 ```bash
-# 复制模板
-cp .env.example .env
-
-# 按需修改
-notepad .env
+python run.py               # interactive, confirmation prompts each round
+python run.py --loop 5      # autonomous: 5 rounds, no prompts
 ```
 
-所有配置项见 `.env.example`，主要：
+Each round the agent team autonomously:
 
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `PROJECT_DIR` | 目标项目路径 | — |
-| `GITHUB_REPO` | 目标仓库 (owner/repo) | — |
-| `TIMEOUT_DEVELOPER` | Developer 超时 (秒) | 10800 |
-| `CODERABBIT_MAX_WAIT` | CodeRabbit 最大等待 (秒) | 900 |
-| `MAX_REVIEW_ROUNDS` | 最大 Review 轮次 | 5 |
+1. Picks the best open issue (or you specify one)
+2. Reads the codebase and fixes it
+3. Local reviewer validates the fix
+4. Opens a PR
+5. Waits for CI / CodeRabbit feedback, fixes, pushes — repeats until approved
 
-## 使用
-
-### 交互模式
-
-```powershell
-python run.py
-```
-
-每轮可选：Agent 自动推荐 Issue 或手动指定编号。
-
-### 自动模式
-
-```powershell
-python run.py --loop 5
-```
-
-连续跑 5 轮，跳过所有确认，全自动运行。
-
-## 架构
+## How It Works
 
 ```
-run.py                    主协调器，控制流程和 session 管理
-config.py                 统一配置（从 .env 加载）
+run.py                    Orchestrator — manages the loop and session lifecycle
+config.py                 Config loaded from .env
 agents/
-  base.py                 Agent 基类、日志、命令执行
-  analyst.py              分析 Agent — 评估 Issue 优先级和范围
-  developer.py            开发 Agent — 修复代码和处理 Review
-  reviewer.py             审阅 Agent — 本地 Code Review
-  submitter.py            提交 Agent — 创建分支、commit、PR
+  base.py                 Agent base class with context-aware runner
+  analyst.py              Analyzes repo issues and recommends what to fix
+  developer.py            Reads code, writes fixes, handles review feedback
+  reviewer.py             Local code review (diff + tests) before push
+  submitter.py            Branches, commits, pushes, opens PR
   runners/
-    base.py               AgentRunner 抽象基类
-    claude.py             ClaudeRunner — claude -p 实现
+    base.py               Abstract runner interface — swap backends easily
+    claude.py             Claude Code runner (`claude -p`)
 ```
 
-## Agent 工作流
+All agents share a single session via `--continue`, so context flows naturally — the developer sees the analyst's findings, the reviewer sees the developer's changes. No re-reading, no copy-pasting prompts.
 
-1. **准备环境** — git checkout main, git pull
-2. **选择模式** — Agent 推荐或手动指定 Issue
-3. **Analyst** — 获取 open issues，排除已有完整 PR 的，推荐最优先项
-4. **Developer** — 通过 `--continue` 共享 session，直接修复
-5. **Reviewer** — 本地预审 (git diff + 测试)，发现问题交 Developer 修复
-6. **Submitter** — 创建分支、commit、push、创建 PR
-7. **CodeRabbit** — 等待 check 完成 → Developer 读取 review → 修复 → 本地 Reviewer 复查通过 → push + @coderabbitai → 循环直到通过或无需修改
+## Configuration
 
-## 接入新 Agent
+See `.env.example`. Key options:
 
-实现 `AgentRunner` 接口，替换 `DEFAULT_RUNNER` 即可：
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `PROJECT_DIR` | Target project | — |
+| `GITHUB_REPO` | owner/repo | — |
+| `TIMEOUT_DEVELOPER` | Dev agent timeout (s) | 10800 |
+| `CODERABBIT_MAX_WAIT` | Max wait for review (s) | 600 |
+| `MAX_REVIEW_ROUNDS` | Max review-fix loops | 3 |
+
+## Bring Your Own Agent
+
+Swap the backend by implementing `AgentRunner`:
 
 ```python
-# agents/runners/custom.py
-from .base import AgentRunner
-class CustomRunner(AgentRunner):
+from agents.runners.base import AgentRunner
+
+class GeminiRunner(AgentRunner):
     def execute(self, prompt, timeout, cwd, continue_session):
-        # 调用你的 agent CLI
-        ...
+        ...  # call your CLI
 
 # agents/base.py
-DEFAULT_RUNNER = CustomRunner()
+DEFAULT_RUNNER = GeminiRunner()
 ```
