@@ -33,7 +33,15 @@ cp .env.example .env        # edit with your settings
 python run.py                       # interactive: confirm & Q&A each round
 python run.py --loop 5              # autonomous: 5 rounds, skip high-risk issues
 python run.py --loop 5 --force      # autonomous: develop all issues regardless of risk
+python run.py --issue 123           # run one unattended issue in an isolated worktree
+python run.py --enqueue 123         # add an issue to the persistent queue
+python run.py --run-next            # claim and run the oldest queued issue
+python run.py --resume RUN_ID       # resume from the persisted workflow stage
+python run.py --list-runs           # inspect recent and active runs
+python run.py --cancel RUN_ID       # release locks and remove an abandoned worktree
 ```
+
+`--cancel` refuses to remove a task that is still owned by a live Agent-Z process. Use it for queued, stopped, or abandoned runs.
 
 ### Interactive Mode
 
@@ -51,6 +59,11 @@ python run.py --loop 5 --force      # autonomous: develop all issues regardless 
 |------|--------|
 | `--loop N` | Run N rounds automatically |
 | `--force` | Ignore risk levels, develop all issues |
+| `--issue N` | Run one issue immediately |
+| `--enqueue N` | Add an issue to the SQLite queue |
+| `--run-next` | Claim the oldest queued task when a slot is available |
+| `--resume RUN_ID` | Resume a failed or interrupted task |
+| `--keep-worktree` | Keep a completed task's worktree |
 
 ## Workflow
 
@@ -65,16 +78,20 @@ Each round:
    - `very_high` — destructive (alters workflows/outputs) → auto-skipped
    - If an assessment already exists, updates it rather than creating a duplicate
 3. **Q&A** (interactive only) — Discuss impacts with the Analyst; `skip` to move on
-4. **Develop** — Fix code in the target workspace
-5. **Review** — Independent local review; findings are explicitly handed back to Developer
-6. **Submit** — Branch, commit, push, open PR
-7. **PR Checks** — Wait for all checks with `gh pr checks --watch` → Developer reads CI and review feedback → fixes → local Reviewer validates → push → repeat until no action is needed
+4. **Isolate** — Create a dedicated branch and Git worktree for the run
+5. **Develop** — Fix code in the isolated worktree
+6. **Review** — Independent local review; findings are explicitly handed back to Developer
+7. **Submit** — Commit, push, open PR
+8. **PR Checks** — Wait for all checks with `gh pr checks --watch` → Developer reads CI and review feedback → fixes → local Reviewer validates → push → repeat until no action is needed
 
 ## Architecture
 
 ```
 run.py                    Orchestrator — loop control and session management
 config.py                 Configuration loaded from .env
+orchestration/
+  store.py                SQLite queue, workflow state, issue and file locks
+  worktree.py             Isolated worktree lifecycle
 agents/
   base.py                 Agent base class with pluggable runner
   analyst.py              Issue analysis, impact assessment, Q&A
@@ -90,6 +107,8 @@ agents/
 
 Each role owns an independent backend session. Analyst, Developer, Reviewer, and Submitter can use different CLIs. The workspace, GitHub issue, PR feedback, and explicit review findings provide cross-role context without sharing an implicit latest session.
 
+Every persisted run has a unique ID and workflow stage. Separate Agent-Z processes can safely execute tasks in parallel up to `MAX_PARALLEL_TASKS`; SQLite enforces Issue locks, and changed-file claims stop overlapping active tasks before submission. Failed, interrupted, and `needs_human` runs keep their worktrees for inspection and resume.
+
 ## Configuration
 
 Copy `.env.example` to `.env` and edit. Full options:
@@ -98,6 +117,9 @@ Copy `.env.example` to `.env` and edit. Full options:
 |----------|-------------|---------|
 | `PROJECT_DIR` | Target project path | — |
 | `GITHUB_REPO` | Target repo (owner/repo) | — |
+| `AGENT_Z_HOME` | Runtime state directory | `.agent-z` |
+| `STATE_DB` | SQLite state database | `.agent-z/state.db` |
+| `WORKTREE_ROOT` | Isolated worktree directory | `.agent-z/worktrees` |
 | `DEFAULT_BACKEND` | Default backend: `claude`, `codex`, or `opencode` | `claude` |
 | `ANALYST_BACKEND` | Analyst backend override | `DEFAULT_BACKEND` |
 | `DEVELOPER_BACKEND` | Developer backend override | `DEFAULT_BACKEND` |
@@ -115,6 +137,9 @@ Copy `.env.example` to `.env` and edit. Full options:
 | `PR_CHECKS_MAX_WAIT` | Max wait for PR checks (s) | 900 |
 | `MAX_REVIEW_ROUNDS` | Max review-fix loops | 5 |
 | `MAX_LOCAL_REVIEW_ROUNDS` | Max local review loops | 5 |
+| `MAX_PARALLEL_TASKS` | Maximum active tasks across processes | 2 |
+| `MAX_RUN_SECONDS` | Per-attempt runtime budget | 21600 |
+| `CLEANUP_COMPLETED_WORKTREES` | Remove worktrees after successful completion | `true` |
 
 Legacy variables `CODERABBIT_POLL_INTERVAL` and `CODERABBIT_MAX_WAIT` remain supported as fallbacks.
 

@@ -22,6 +22,21 @@ class QuietRunTest(unittest.TestCase):
             self.addCleanup(patcher.stop)
 
 
+class InteractiveImpactTests(QuietRunTest):
+    @patch("run.Prompt.ask", side_effect=["What changes?", "done"])
+    def test_questions_continue_analyst_session(self, ask):
+        analyst = Mock()
+        analyst.chat.return_value = "Only the API changes."
+        self.assertTrue(run._interactive_impact_qa(analyst, "medium"))
+        analyst.chat.assert_called_once_with("What changes?")
+
+    @patch("run.Prompt.ask", return_value="skip")
+    def test_skip_stops_before_development(self, ask):
+        analyst = Mock()
+        self.assertFalse(run._interactive_impact_qa(analyst, "high"))
+        analyst.chat.assert_not_called()
+
+
 class PrChecksTests(QuietRunTest):
     @patch("run.run_cmd", return_value=result(1, stderr="no checks reported on the 'main' branch"))
     def test_no_checks_reported_is_retryable(self, run_cmd):
@@ -94,32 +109,38 @@ class LocalReviewTests(QuietRunTest):
 
 
 class RoundFlowTests(QuietRunTest):
-    @patch("run.managed_environment")
-    @patch("run.run_local_review", return_value=False)
+    @patch("run.execute_task", return_value=False)
+    @patch("run._session_snapshot", return_value={"analyst": "session-1"})
     @patch("run.confirm_issue", return_value=1)
-    @patch("run.choose_issue", return_value=1)
     @patch("run.show_analysis")
-    def test_failed_pre_review_does_not_submit(
+    def test_round_creates_persisted_task(
         self,
         show_analysis,
-        choose_issue,
         confirm_issue,
-        local_review,
-        environment,
+        session_snapshot,
+        execute_task,
     ):
         analyst = Mock()
         analyst.analyze.return_value = (1, "analysis")
-        analyst.assess_impact.return_value = ("impact", "low")
         developer = Mock()
         reviewer = Mock()
         submitter = Mock()
+        record = SimpleNamespace(run_id="run-1")
+        store = Mock()
+        store.create.return_value = record
+        store.update.return_value = record
+        worktrees = Mock()
         with patch("run.AUTO_MODE", True):
-            self.assertFalse(run.run_round(analyst, developer, reviewer, submitter))
+            self.assertFalse(run.run_round(
+                analyst, developer, reviewer, submitter,
+                store, worktrees, target_issue=1,
+            ))
         analyst.reset_session.assert_called_once()
         developer.reset_session.assert_called_once()
         reviewer.reset_session.assert_called_once()
         submitter.reset_session.assert_called_once()
-        submitter.submit.assert_not_called()
+        store.create.assert_called_once()
+        execute_task.assert_called_once()
 
 
 class ValidationTests(QuietRunTest):
@@ -140,45 +161,22 @@ class ValidationTests(QuietRunTest):
             run.validate_environment()
 
 
-class ManagedEnvironmentTests(QuietRunTest):
-    @patch("run._find_stash_ref", side_effect=["stash@{0}", "stash@{0}"])
-    @patch("run.run_cmd")
-    def test_stash_is_restored_and_dropped(self, run_cmd, find_stash):
-        def execute(args, **kwargs):
-            if args[:4] == ["git", "symbolic-ref", "--short", "-q"]:
-                return result(stdout="feature\n")
-            if args == ["git", "status", "--short"]:
-                return result(stdout=" M work.py\n")
-            return result()
+class CancelRunTests(QuietRunTest):
+    def test_cancel_rejects_live_owner(self):
+        store = Mock()
+        store.cancel.side_effect = RuntimeError("active process")
+        worktrees = Mock()
+        with self.assertRaisesRegex(RuntimeError, "active process"):
+            run.cancel_run(store, worktrees, "run-1")
+        worktrees.remove.assert_not_called()
 
-        run_cmd.side_effect = execute
-        with run.managed_environment():
-            pass
-
-        commands = [entry.args[0] for entry in run_cmd.call_args_list]
-        self.assertTrue(any(command[:4] == ["git", "stash", "push", "-u"] for command in commands))
-        self.assertIn(["git", "checkout", "feature"], commands)
-        self.assertIn(["git", "stash", "apply", "stash@{0}"], commands)
-        self.assertIn(["git", "stash", "drop", "stash@{0}"], commands)
-
-    @patch("run._find_stash_ref", side_effect=["stash@{0}", "stash@{0}"])
-    @patch("run.run_cmd")
-    def test_restore_conflict_keeps_stash(self, run_cmd, find_stash):
-        def execute(args, **kwargs):
-            if args[:4] == ["git", "symbolic-ref", "--short", "-q"]:
-                return result(stdout="feature\n")
-            if args == ["git", "status", "--short"]:
-                return result(stdout=" M work.py\n")
-            if args == ["git", "stash", "apply", "stash@{0}"]:
-                return result(1, stderr="conflict")
-            return result()
-
-        run_cmd.side_effect = execute
-        with run.managed_environment():
-            pass
-
-        commands = [entry.args[0] for entry in run_cmd.call_args_list]
-        self.assertNotIn(["git", "stash", "drop", "stash@{0}"], commands)
+    def test_cancel_cleans_stale_run(self):
+        store = Mock()
+        store.cancel.return_value = SimpleNamespace(worktree_path="worktree")
+        worktrees = Mock()
+        run.cancel_run(store, worktrees, "run-1")
+        worktrees.remove.assert_called_once_with("worktree")
+        store.update.assert_called_once_with("run-1", worktree_path=None)
 
 
 if __name__ == "__main__":

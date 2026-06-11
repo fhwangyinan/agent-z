@@ -48,9 +48,24 @@ def _get_positive_int(key: str, default: int, fallback_key: str | None = None) -
     return value
 
 
+def _get_bool(key: str, default: bool) -> bool:
+    raw = os.environ.get(key)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{key} must be a boolean, got {raw!r}")
+
+
 # ---- Project ----
 PROJECT_DIR = _get("PROJECT_DIR", r"G:\Code\workspace_aieng")
 GITHUB_REPO = _get("GITHUB_REPO", "armpro24-blip/cad-cae-copilot")
+AGENT_Z_HOME = _get("AGENT_Z_HOME", os.path.join(_BASE, ".agent-z"))
+STATE_DB = _get("STATE_DB", os.path.join(AGENT_Z_HOME, "state.db"))
+WORKTREE_ROOT = _get("WORKTREE_ROOT", os.path.join(AGENT_Z_HOME, "worktrees"))
 
 # ---- Agent backends ----
 DEFAULT_BACKEND = _get("DEFAULT_BACKEND", "claude").lower()
@@ -80,3 +95,8 @@ PR_CHECKS_MAX_WAIT = _get_positive_int(
 )
 MAX_REVIEW_ROUNDS = _get_positive_int("MAX_REVIEW_ROUNDS", 5)
 MAX_LOCAL_REVIEW_ROUNDS = _get_positive_int("MAX_LOCAL_REVIEW_ROUNDS", 5)
+
+# ---- Run control ----
+MAX_PARALLEL_TASKS = _get_positive_int("MAX_PARALLEL_TASKS", 2)
+MAX_RUN_SECONDS = _get_positive_int("MAX_RUN_SECONDS", 21600)
+CLEANUP_COMPLETED_WORKTREES = _get_bool("CLEANUP_COMPLETED_WORKTREES", True)

@@ -9,8 +9,6 @@ import shutil
 import subprocess
 import sys
 import time
-import uuid
-from contextlib import contextmanager
 
 from rich.align import Align
 from rich.console import Console
@@ -22,6 +20,7 @@ AUTO_MODE = False
 TOTAL_LOOPS = 0
 CURRENT_LOOP = 0
 FORCE_DEVELOP = False
+KEEP_WORKTREE = False
 
 from agents.base import log, step, done, warn, error, run_cmd, PROJECT_DIR, GITHUB_REPO
 from agents import __version__
@@ -29,6 +28,7 @@ from agents.analyst import AnalystAgent
 from agents.developer import DeveloperAgent
 from agents.reviewer import ReviewerAgent
 from agents.submitter import SubmitterAgent
+from orchestration import RunRecord, RunStore, WorktreeManager
 
 console = Console()
 
@@ -41,6 +41,11 @@ from config import (
     PR_CHECKS_MAX_WAIT,
     MAX_REVIEW_ROUNDS,
     MAX_LOCAL_REVIEW_ROUNDS,
+    STATE_DB,
+    WORKTREE_ROOT,
+    MAX_PARALLEL_TASKS,
+    MAX_RUN_SECONDS,
+    CLEANUP_COMPLETED_WORKTREES,
 )
 
 
@@ -57,7 +62,7 @@ def show_banner():
         )
     ))
     console.print(Align.center(
-        "[dim]🔍 Analyst[/dim] → [dim]🔧 Developer[/dim] → [dim]👁 Reviewer[/dim] → [dim]🚀 Submitter[/dim] → [dim]🐰 CodeRabbit[/dim]"
+        "[dim]🔍 Analyst[/dim] → [dim]🔧 Developer[/dim] → [dim]👁 Reviewer[/dim] → [dim]🚀 Submitter[/dim] → [dim]✅ PR Checks[/dim]"
     ))
 
 
@@ -84,58 +89,10 @@ def validate_environment():
         raise RuntimeError(f"PROJECT_DIR is not a Git work tree: {PROJECT_DIR}")
 
 
-def _find_stash_ref(message: str) -> str | None:
-    result = run_cmd(["git", "stash", "list", "--format=%gd%x09%gs"], check=False)
-    if result.returncode != 0:
-        return None
-    for line in result.stdout.splitlines():
-        ref, _, subject = line.partition("\t")
-        if message in subject:
-            return ref
-    return None
-
-
-@contextmanager
-def managed_environment():
-    step("📦 Prepare environment")
-    original_branch = run_cmd(
-        ["git", "symbolic-ref", "--short", "-q", "HEAD"], check=False
-    ).stdout.strip()
-    original_ref = original_branch or run_cmd(["git", "rev-parse", "HEAD"]).stdout.strip()
-    stash_message = f"agent-z-auto-stash-{uuid.uuid4().hex}"
-    created_stash = False
-
-    status = run_cmd(["git", "status", "--short"], check=False)
-    if status.stdout.strip():
-        log("Stashing local changes...")
-        result = run_cmd(["git", "stash", "push", "-u", "-m", stash_message], check=False)
-        created_stash = result.returncode == 0 and _find_stash_ref(stash_message) is not None
-        if not created_stash:
-            raise RuntimeError("failed to stash local changes; aborting before checkout")
-
-    try:
-        run_cmd(["git", "checkout", "main"])
-        run_cmd(["git", "pull", "origin", "main"], verbose=True)
-        done("Environment ready")
-        yield
-    finally:
-        step("📦 Restore original workspace")
-        checkout = run_cmd(["git", "checkout", original_ref], check=False)
-        if checkout.returncode != 0:
-            warn("Could not restore the original ref; the automatic stash was preserved")
-        elif created_stash:
-            stash_ref = _find_stash_ref(stash_message)
-            if not stash_ref:
-                warn("Could not find the automatic stash; inspect `git stash list`")
-            else:
-                applied = run_cmd(["git", "stash", "apply", stash_ref], check=False)
-                if applied.returncode != 0:
-                    warn(f"Restoring local changes caused conflicts; preserved {stash_ref}")
-                else:
-                    run_cmd(["git", "stash", "drop", stash_ref], check=False)
-                    done("Original workspace restored")
-        else:
-            done("Original workspace restored")
+def prepare_base_repo():
+    step("📦 Refresh base repository")
+    run_cmd(["git", "fetch", "origin", "main"], verbose=True)
+    done("Base repository refreshed")
 
 
 def _get_pr_checks(pr_url: str) -> list[dict] | None:
@@ -308,110 +265,390 @@ def run_local_review(
     return False
 
 
-def run_round(
+def _agents(analyst, developer, reviewer, submitter):
+    return (analyst, developer, reviewer, submitter)
+
+
+def _session_snapshot(analyst, developer, reviewer, submitter) -> dict[str, str]:
+    return {
+        agent.name.lower(): agent.session_id
+        for agent in _agents(analyst, developer, reviewer, submitter)
+        if agent.session_id
+    }
+
+
+def _restore_sessions(record: RunRecord, analyst, developer, reviewer, submitter):
+    for agent in _agents(analyst, developer, reviewer, submitter):
+        agent.reset_session()
+        agent.session_id = record.sessions.get(agent.name.lower())
+
+
+def _set_workspace(path: str, analyst, developer, reviewer, submitter):
+    for agent in _agents(analyst, developer, reviewer, submitter):
+        agent.set_workspace(path)
+
+
+def _checkpoint(
+    store: RunStore,
+    record: RunRecord,
+    analyst,
+    developer,
+    reviewer,
+    submitter,
+    **fields,
+) -> RunRecord:
+    fields["sessions"] = _session_snapshot(analyst, developer, reviewer, submitter)
+    return store.update(record.run_id, **fields)
+
+
+def _check_run_budget(started: float):
+    if time.monotonic() - started >= MAX_RUN_SECONDS:
+        raise RuntimeError(f"run exceeded MAX_RUN_SECONDS ({MAX_RUN_SECONDS})")
+
+
+def _interactive_impact_qa(analyst: AnalystAgent, risk: str) -> bool:
+    console.print(
+        "\n[dim]Risk: [bold]{0}[/bold] | ask a question | [bold]skip[/bold] issue | "
+        "[bold]done[/bold]/Enter to develop[/dim]".format(risk)
+    )
+    while True:
+        question = Prompt.ask("", default="").strip()
+        if not question or question.lower() in ("done", "ok", "go", "y"):
+            return True
+        if question.lower() in ("skip", "s"):
+            return False
+        answer = analyst.chat(question)
+        console.print(Panel(answer[:2000], border_style="dim"))
+
+
+def _claim_changed_files(store: RunStore, record: RunRecord) -> RunRecord:
+    changed = run_cmd(
+        ["git", "diff", "--name-only", "origin/main"],
+        cwd=record.worktree_path,
+        check=False,
+    )
+    untracked = run_cmd(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=record.worktree_path,
+        check=False,
+    )
+    if changed.returncode != 0 or untracked.returncode != 0:
+        raise RuntimeError("could not determine changed files for conflict detection")
+    files = [
+        line.strip()
+        for output in (changed.stdout, untracked.stdout)
+        for line in output.splitlines()
+        if line.strip()
+    ]
+    return store.claim_files(record.run_id, files)
+
+
+def execute_task(
+    record: RunRecord,
+    store: RunStore,
+    worktrees: WorktreeManager,
     analyst: AnalystAgent,
     developer: DeveloperAgent,
     reviewer: ReviewerAgent,
     submitter: SubmitterAgent,
 ) -> bool:
-    for agent in (analyst, developer, reviewer, submitter):
-        agent.reset_session()
+    started = time.monotonic()
+    _restore_sessions(record, analyst, developer, reviewer, submitter)
 
-    with managed_environment():
-        target = choose_issue()
+    if record.worktree_path:
+        workspace = worktrees.validate(record.worktree_path)
+        _set_workspace(str(workspace), analyst, developer, reviewer, submitter)
 
-        step("🔍 Analyst")
-        if target:
-            issue_number, analysis = analyst.analyze(target_issue=target, resume_session=False)
+    try:
+        if record.stage in {"queued", "analyzing"}:
+            record = _checkpoint(
+                store, record, analyst, developer, reviewer, submitter,
+                status="running", stage="analyzing",
+            )
+            step("🔍 Analyst")
+            _, analysis = analyst.analyze(
+                target_issue=record.issue_number,
+                resume_session=bool(analyst.session_id),
+            )
+            show_analysis(record.issue_number, analysis)
+            record = _checkpoint(
+                store, record, analyst, developer, reviewer, submitter,
+                stage="created",
+            )
+
+        if record.stage in {"created", "assessing"}:
+            record = _checkpoint(
+                store, record, analyst, developer, reviewer, submitter,
+                status="running", stage="assessing",
+            )
+            step("🔍 Impact assessment")
+            impact, risk = analyst.assess_impact(
+                record.issue_number,
+                resume_session=bool(analyst.session_id),
+            )
+            console.print(Panel(
+                impact[:2500],
+                title=f"Impact assessment [yellow]risk: {risk}[/yellow]",
+                border_style="yellow",
+            ))
+            record = _checkpoint(
+                store, record, analyst, developer, reviewer, submitter,
+                risk=risk, stage="assessed",
+            )
         else:
-            issue_number, analysis = analyst.analyze(resume_session=False)
+            risk = record.risk or "unknown"
 
-        if issue_number is None:
-            error("Analyst did not recommend an issue")
+        if AUTO_MODE and not FORCE_DEVELOP and risk in ("high", "very_high"):
+            warn(f"Risk is [{risk}]; skipping automatically")
+            _checkpoint(
+                store, record, analyst, developer, reviewer, submitter,
+                status="skipped", stage="skipped",
+            )
             return False
-
-        show_analysis(issue_number, analysis)
-        issue_number = confirm_issue(issue_number)
-        if issue_number is None:
-            log("Skipped; moving to the next round")
-            return False
-
-        step("🔍 Impact assessment")
-        impact, risk = analyst.assess_impact(issue_number, resume_session=True)
-        console.print(Panel(impact[:2500], title=f"Impact assessment [yellow]risk: {risk}[/yellow]", border_style="yellow"))
-
-        if AUTO_MODE and not FORCE_DEVELOP:
-            if risk in ("high", "very_high"):
-                warn(f"Risk is [{risk}]; skipping automatically")
+        if not AUTO_MODE and record.stage == "assessed":
+            if not _interactive_impact_qa(analyst, risk):
+                log("Issue skipped by user")
+                _checkpoint(
+                    store, record, analyst, developer, reviewer, submitter,
+                    status="skipped", stage="skipped",
+                )
                 return False
-        else:
-            console.print("\n[dim]Risk: [bold]{0}[/bold] | ask a question | [bold]skip[/bold] issue | [bold]done[/bold]/Enter to develop[/dim]".format(risk))
-            while True:
-                question = Prompt.ask("", default="").strip()
-                if not question:
-                    break
-                if question.lower() in ("skip", "s"):
-                    log("Issue skipped by user")
-                    return False
-                if question.lower() in ("done", "ok", "go", "y"):
-                    break
-                answer = analyst.chat(question)
-                console.print(Panel(answer[:2000], border_style="dim"))
 
-        step("🔧 Developer")
-        developer.fix(issue_number, resume_session=False)
+        _check_run_budget(started)
+        if not record.worktree_path:
+            prepare_base_repo()
+            branch = record.branch or f"agent-z/{record.issue_number}-{record.run_id}"
+            workspace = worktrees.create(record.run_id, branch)
+            record = _checkpoint(
+                store, record, analyst, developer, reviewer, submitter,
+                branch=branch, worktree_path=str(workspace), stage="developing",
+            )
+            _set_workspace(str(workspace), analyst, developer, reviewer, submitter)
 
-        step("👁 Local Reviewer")
-        if not run_local_review(issue_number, reviewer, developer):
-            return False
+        if record.stage in {"assessed", "developing"}:
+            record = _checkpoint(
+                store, record, analyst, developer, reviewer, submitter,
+                status="running", stage="developing",
+            )
+            step("🔧 Developer")
+            developer.fix(record.issue_number, resume_session=bool(developer.session_id))
+            record = _checkpoint(
+                store, record, analyst, developer, reviewer, submitter,
+                stage="reviewing",
+            )
+            record = _claim_changed_files(store, record)
 
-        step("🚀 Submitter")
-        pr_url = submitter.submit(issue_number, resume_session=False)
-        if not pr_url:
-            error("Submitter did not create a PR")
-            return False
-        console.print(Panel(
-            f"[link={pr_url}]{pr_url}[/link]",
-            title="[bold green]🚀 PR created[/bold green]",
-            border_style="green",
-        ))
+        _check_run_budget(started)
+        if record.stage == "reviewing":
+            step("👁 Local Reviewer")
+            if not run_local_review(record.issue_number, reviewer, developer):
+                _checkpoint(
+                    store, record, analyst, developer, reviewer, submitter,
+                    status="needs_human", stage="reviewing",
+                    error="local review limit reached",
+                )
+                return False
+            record = _claim_changed_files(store, record)
+            record = _checkpoint(
+                store, record, analyst, developer, reviewer, submitter,
+                stage="submitting",
+            )
+
+        if record.stage == "submitting":
+            step("🚀 Submitter")
+            pr_url = submitter.submit(
+                record.issue_number,
+                resume_session=bool(submitter.session_id),
+            )
+            if not pr_url:
+                raise RuntimeError("Submitter did not create a PR")
+            console.print(Panel(
+                f"[link={pr_url}]{pr_url}[/link]",
+                title="[bold green]🚀 PR created[/bold green]",
+                border_style="green",
+            ))
+            record = _checkpoint(
+                store, record, analyst, developer, reviewer, submitter,
+                status="waiting_checks", stage="waiting_checks", pr_url=pr_url,
+            )
 
         for review_count in range(MAX_REVIEW_ROUNDS):
-            if not wait_for_pr_checks(pr_url):
-                return False
+            _check_run_budget(started)
+            if record.stage not in {"waiting_checks", "handling_feedback"}:
+                break
+            if record.stage == "waiting_checks":
+                if not wait_for_pr_checks(record.pr_url):
+                    _checkpoint(
+                        store, record, analyst, developer, reviewer, submitter,
+                        status="needs_human", stage="waiting_checks",
+                        error="PR checks did not reach a final state",
+                    )
+                    return False
+                record = _checkpoint(
+                    store, record, analyst, developer, reviewer, submitter,
+                    status="running", stage="handling_feedback",
+                )
 
             step(f"🔧 Developer handles PR feedback (round {review_count + 1}/{MAX_REVIEW_ROUNDS})")
-            dev_output = developer.apply_review(issue_number, pr_url, resume_session=True)
+            dev_output = developer.apply_review(
+                record.issue_number,
+                record.pr_url,
+                resume_session=True,
+            )
             if "NO_ACTION_NEEDED" in dev_output.upper():
                 done("Developer reported no action needed")
                 break
-
-            if not run_local_review(issue_number, reviewer, developer, follow_up=True):
+            if not run_local_review(record.issue_number, reviewer, developer, follow_up=True):
+                _checkpoint(
+                    store, record, analyst, developer, reviewer, submitter,
+                    status="needs_human", stage="handling_feedback",
+                    error="local review limit reached after PR feedback",
+                )
                 return False
+            record = _claim_changed_files(store, record)
             done("Local Reviewer approved; pushing")
-            developer.push_and_notify(pr_url, resume_session=True)
+            developer.push_and_notify(record.pr_url, resume_session=True)
+            record = _checkpoint(
+                store, record, analyst, developer, reviewer, submitter,
+                status="waiting_checks", stage="waiting_checks",
+            )
         else:
-            warn(f"Reached the PR feedback limit ({MAX_REVIEW_ROUNDS}); stopping this run")
+            _checkpoint(
+                store, record, analyst, developer, reviewer, submitter,
+                status="needs_human", stage=record.stage,
+                error="PR feedback limit reached",
+            )
             return False
 
+        record = _checkpoint(
+            store, record, analyst, developer, reviewer, submitter,
+            status="completed", stage="completed", error=None,
+        )
         console.print(Panel(
-            f"[bold green]✅ Issue #{issue_number} completed[/bold green]\n[dim]{pr_url}[/dim]",
+            f"[bold green]✅ Issue #{record.issue_number} completed[/bold green]\n"
+            f"[dim]Run: {record.run_id}\n{record.pr_url}[/dim]",
             border_style="green",
         ))
+        if CLEANUP_COMPLETED_WORKTREES and not KEEP_WORKTREE and record.worktree_path:
+            try:
+                worktrees.remove(record.worktree_path)
+                store.update(record.run_id, worktree_path=None)
+            except Exception as exc:
+                warn(f"Run completed, but worktree cleanup failed: {exc}")
         return True
+    except KeyboardInterrupt:
+        _checkpoint(
+            store, record, analyst, developer, reviewer, submitter,
+            status="needs_human", error="interrupted by user",
+        )
+        raise
+    except Exception as exc:
+        status = "needs_human" if "file lock conflict" in str(exc) else "failed"
+        _checkpoint(
+            store, record, analyst, developer, reviewer, submitter,
+            status=status, error=str(exc),
+        )
+        raise
 
 
-def main():
+def run_round(
+    analyst: AnalystAgent,
+    developer: DeveloperAgent,
+    reviewer: ReviewerAgent,
+    submitter: SubmitterAgent,
+    store: RunStore,
+    worktrees: WorktreeManager,
+    target_issue: int | None = None,
+) -> bool:
+    for agent in (analyst, developer, reviewer, submitter):
+        agent.reset_session()
+    target = target_issue if target_issue is not None else choose_issue()
+    step("🔍 Analyst")
+    if target:
+        issue_number, analysis = analyst.analyze(target_issue=target, resume_session=False)
+    else:
+        issue_number, analysis = analyst.analyze(resume_session=False)
+    if issue_number is None:
+        error("Analyst did not recommend an issue")
+        return False
+    show_analysis(issue_number, analysis)
+    issue_number = confirm_issue(issue_number)
+    if issue_number is None:
+        log("Skipped; moving to the next round")
+        return False
+    record = store.create(GITHUB_REPO, issue_number, MAX_PARALLEL_TASKS)
+    record = store.update(
+        record.run_id,
+        sessions=_session_snapshot(analyst, developer, reviewer, submitter),
+    )
+    console.print(f"  [dim]Run ID: {record.run_id}[/dim]")
+    return execute_task(
+        record, store, worktrees, analyst, developer, reviewer, submitter
+    )
+
+
+def _build_agents():
+    return AnalystAgent(), DeveloperAgent(), ReviewerAgent(), SubmitterAgent()
+
+
+def show_runs(store: RunStore):
+    table = Table(title="Agent-Z runs")
+    table.add_column("Run ID", style="cyan")
+    table.add_column("Issue")
+    table.add_column("Status")
+    table.add_column("Stage")
+    table.add_column("PR")
+    table.add_column("Updated")
+    for record in store.list():
+        table.add_row(
+            record.run_id,
+            f"#{record.issue_number}",
+            record.status,
+            record.stage,
+            record.pr_url or "",
+            record.updated_at.replace("T", " ")[:19],
+        )
+    console.print(table)
+
+
+def cancel_run(store: RunStore, worktrees: WorktreeManager, run_id: str):
+    record = store.cancel(run_id)
+    if record.worktree_path:
+        worktrees.remove(record.worktree_path)
+        store.update(run_id, worktree_path=None)
+    done(f"Cancelled run {run_id}")
+
+
+def main(target_issue: int | None = None, resume_id: str | None = None):
     validate_environment()
     show_banner()
-    analyst = AnalystAgent()
-    developer = DeveloperAgent()
-    reviewer = ReviewerAgent()
-    submitter = SubmitterAgent()
+    store = RunStore(STATE_DB)
+    worktrees = WorktreeManager(PROJECT_DIR, WORKTREE_ROOT)
+    analyst, developer, reviewer, submitter = _build_agents()
+
+    if resume_id:
+        record = store.resume(resume_id, MAX_PARALLEL_TASKS)
+        return execute_task(
+            record, store, worktrees, analyst, developer, reviewer, submitter
+        )
+
+    return run_round(
+        analyst, developer, reviewer, submitter,
+        store, worktrees, target_issue=target_issue,
+    ) if target_issue is not None else _interactive_loop(
+        analyst, developer, reviewer, submitter, store, worktrees
+    )
+
+
+def _interactive_loop(analyst, developer, reviewer, submitter, store, worktrees):
+    result = False
 
     while True:
         try:
-            run_round(analyst, developer, reviewer, submitter)
+            result = run_round(
+                analyst, developer, reviewer, submitter,
+                store, worktrees,
+            )
 
         except KeyboardInterrupt:
             console.print("\n[yellow]Interrupted by user[/yellow]")
@@ -427,22 +664,75 @@ def main():
         if not Confirm.ask("[bold]Start another round?[/bold]", default=True):
             done("Exiting")
             break
+    return result
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Multi-agent automated issue fixing")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--issue", type=int, metavar="N",
+                      help="run one unattended task for issue N")
+    mode.add_argument("--enqueue", type=int, metavar="N",
+                      help="enqueue issue N without starting it")
+    mode.add_argument("--run-next", action="store_true",
+                      help="claim and run the oldest queued task")
+    mode.add_argument("--resume", metavar="RUN_ID",
+                      help="resume an existing run")
+    mode.add_argument("--list-runs", action="store_true",
+                      help="list recent persisted runs")
+    mode.add_argument("--cancel", metavar="RUN_ID",
+                      help="cancel a run, release its lock, and remove its worktree")
     parser.add_argument("--loop", type=int, default=0, metavar="N",
                         help="autonomous mode: run N rounds without confirmation")
     parser.add_argument("--force", action="store_true",
-                        help="develop high-risk issues too (requires --loop)")
+                        help="develop high-risk issues too")
+    parser.add_argument("--keep-worktree", action="store_true",
+                        help="keep a completed run's worktree")
     args = parser.parse_args()
-    if args.force and args.loop <= 0:
-        parser.error("--force requires --loop N")
+    if args.loop > 0 and any((args.issue, args.enqueue, args.run_next, args.resume, args.list_runs, args.cancel)):
+        parser.error("--loop cannot be combined with another run mode")
+    if args.force and args.loop <= 0 and not args.issue and not args.resume and not args.run_next:
+        parser.error("--force requires --loop, --issue, --resume, or --run-next")
+
+    FORCE_DEVELOP = args.force
+    KEEP_WORKTREE = args.keep_worktree
+    if args.list_runs:
+        show_runs(RunStore(STATE_DB))
+        raise SystemExit(0)
+    if args.enqueue:
+        record = RunStore(STATE_DB).enqueue(GITHUB_REPO, args.enqueue)
+        done(f"Enqueued issue #{args.enqueue} as run {record.run_id}")
+        raise SystemExit(0)
+    if args.cancel:
+        cancel_run(
+            RunStore(STATE_DB),
+            WorktreeManager(PROJECT_DIR, WORKTREE_ROOT),
+            args.cancel,
+        )
+        raise SystemExit(0)
+    if args.run_next:
+        store = RunStore(STATE_DB)
+        record = store.claim_next(MAX_PARALLEL_TASKS)
+        if record is None:
+            warn("No queued task is available or all parallel slots are occupied")
+            raise SystemExit(1)
+        AUTO_MODE = True
+        main(resume_id=record.run_id)
+        raise SystemExit(0)
+    if args.resume:
+        AUTO_MODE = True
+        main(resume_id=args.resume)
+        raise SystemExit(0)
+    if args.issue:
+        AUTO_MODE = True
+        TOTAL_LOOPS = 1
+        CURRENT_LOOP = 1
+        main(target_issue=args.issue)
+        raise SystemExit(0)
 
     if args.loop > 0:
         AUTO_MODE = True
         TOTAL_LOOPS = args.loop
-        FORCE_DEVELOP = args.force
         console.print(f"[bold cyan]Autonomous mode[/bold cyan] [dim]{TOTAL_LOOPS} round(s)[/dim]")
         if FORCE_DEVELOP:
             console.print("[yellow]⚠ Force mode: risk levels are ignored[/yellow]")

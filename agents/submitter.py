@@ -8,8 +8,8 @@ class SubmitterAgent(Agent):
 
     def submit(self, issue_number: int, resume_session: bool = False) -> str:
         prompt = (
-            f"Create a branch for the fix to issue #{issue_number}, commit, push, and open a PR against "
-            f"main. Link issue #{issue_number} in the PR body and leave an English issue comment "
+            f"Use the current worktree branch for the fix to issue #{issue_number}. Commit, push, and "
+            f"open a PR against main. Link issue #{issue_number} in the PR body and leave an English issue comment "
             f"summarizing the completed work. End with PR_URL=<url>."
         )
         output = self.run(prompt, timeout=TIMEOUT_SUBMITTER, resume_session=resume_session)

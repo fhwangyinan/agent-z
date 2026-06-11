@@ -108,9 +108,13 @@ class Agent:
         self.color = AGENT_COLORS.get(name, "white")
         self.runner = runner or create_runner(backend)
         self.session_id: str | None = None
+        self.cwd = PROJECT_DIR
 
     def reset_session(self):
         self.session_id = None
+
+    def set_workspace(self, cwd: str):
+        self.cwd = cwd
 
     def run(self, prompt: str, timeout: int = 600, resume_session: bool = False) -> str:
         session_id = self.session_id if resume_session else None
@@ -119,7 +123,7 @@ class Agent:
             result = self.runner.execute(
                 prompt=prompt,
                 timeout=timeout,
-                cwd=PROJECT_DIR,
+                cwd=self.cwd,
                 session_id=session_id,
             )
         self.session_id = result.session_id
