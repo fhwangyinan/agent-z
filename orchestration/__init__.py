@@ -1,4 +1,4 @@
-from .store import RunRecord, RunStore
+from .store import RunEvent, RunRecord, RunStore
 from .worktree import WorktreeManager
 
-__all__ = ["RunRecord", "RunStore", "WorktreeManager"]
+__all__ = ["RunEvent", "RunRecord", "RunStore", "WorktreeManager"]

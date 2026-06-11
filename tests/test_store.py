@@ -29,6 +29,11 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(resumed.status, "running")
         self.assertIsNotNone(resumed.owner_pid)
         self.assertIsNone(resumed.error)
+        events = self.store.list_events(record.run_id)
+        event_types = [event.event_type for event in events]
+        self.assertIn("run_created", event_types)
+        self.assertIn("status_changed", event_types)
+        self.assertIn("run_resumed", event_types)
 
     def test_active_issue_lock_prevents_duplicate(self):
         self.store.create("owner/repo", 12, max_parallel=2)
@@ -50,6 +55,9 @@ class RunStoreTests(unittest.TestCase):
         first = self.store.create("owner/repo", 1, max_parallel=2)
         second = self.store.create("owner/repo", 2, max_parallel=2)
         self.store.claim_files(first.run_id, ["src/shared.py"])
+        event = self.store.list_events(first.run_id)[-1]
+        self.assertEqual(event.event_type, "files_claimed")
+        self.assertEqual(event.data["files"], ["src/shared.py"])
         with self.assertRaisesRegex(RuntimeError, "file lock conflict"):
             self.store.claim_files(second.run_id, ["src/shared.py", "src/other.py"])
 
@@ -59,6 +67,7 @@ class RunStoreTests(unittest.TestCase):
         claimed = self.store.claim_next(max_parallel=1)
         self.assertEqual(claimed.run_id, first.run_id)
         self.assertEqual(claimed.status, "running")
+        self.assertEqual(self.store.list_events(first.run_id)[-1].event_type, "run_claimed")
         self.assertIsNone(self.store.claim_next(max_parallel=1))
 
     def test_queued_issue_is_locked(self):

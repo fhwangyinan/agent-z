@@ -38,7 +38,9 @@ python run.py --enqueue 123         # add an issue to the persistent queue
 python run.py --run-next            # claim and run the oldest queued issue
 python run.py --resume RUN_ID       # resume from the persisted workflow stage
 python run.py --list-runs           # inspect recent and active runs
+python run.py --inspect RUN_ID      # show run metadata and structured events
 python run.py --cancel RUN_ID       # release locks and remove an abandoned worktree
+python run.py --worker              # continuously claim queued tasks
 ```
 
 `--cancel` refuses to remove a task that is still owned by a live Agent-Z process. Use it for queued, stopped, or abandoned runs.
@@ -63,6 +65,9 @@ python run.py --cancel RUN_ID       # release locks and remove an abandoned work
 | `--enqueue N` | Add an issue to the SQLite queue |
 | `--run-next` | Claim the oldest queued task when a slot is available |
 | `--resume RUN_ID` | Resume a failed or interrupted task |
+| `--inspect RUN_ID` | Show persisted metadata and structured event history |
+| `--worker` | Run a lightweight queue worker until interrupted |
+| `--worker-max-runs N` | Stop worker after N claimed runs (`0` = forever) |
 | `--keep-worktree` | Keep a completed task's worktree |
 
 ## Workflow
@@ -109,6 +114,8 @@ Each role owns an independent backend session. Analyst, Developer, Reviewer, and
 
 Every persisted run has a unique ID and workflow stage. Separate Agent-Z processes can safely execute tasks in parallel up to `MAX_PARALLEL_TASKS`; SQLite enforces Issue locks, and changed-file claims stop overlapping active tasks before submission. Failed, interrupted, and `needs_human` runs keep their worktrees for inspection and resume.
 
+Structured run events are stored in SQLite for queue, worker, stage, status, resume, cancel, and file-claim transitions. Use `python run.py --inspect RUN_ID` to review the timeline when a remote or unattended run needs diagnosis.
+
 ## Configuration
 
 Copy `.env.example` to `.env` and edit. Full options:
@@ -140,6 +147,7 @@ Copy `.env.example` to `.env` and edit. Full options:
 | `MAX_PARALLEL_TASKS` | Maximum active tasks across processes | 2 |
 | `MAX_RUN_SECONDS` | Per-attempt runtime budget | 21600 |
 | `CLEANUP_COMPLETED_WORKTREES` | Remove worktrees after successful completion | `true` |
+| `WORKER_IDLE_SLEEP` | Queue worker sleep when no task is available | 30 |
 
 Legacy variables `CODERABBIT_POLL_INTERVAL` and `CODERABBIT_MAX_WAIT` remain supported as fallbacks.
 

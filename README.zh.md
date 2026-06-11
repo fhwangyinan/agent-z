@@ -38,7 +38,9 @@ python run.py --enqueue 123         # 将 issue 加入持久化队列
 python run.py --run-next            # 领取并执行最早的排队任务
 python run.py --resume RUN_ID       # 从持久化阶段恢复任务
 python run.py --list-runs           # 查看最近及活跃任务
+python run.py --inspect RUN_ID      # 查看任务元数据和结构化事件
 python run.py --cancel RUN_ID       # 释放锁并清理废弃 worktree
+python run.py --worker              # 持续领取队列任务
 ```
 
 `--cancel` 会拒绝删除仍由活跃 Agent-Z 进程持有的任务；它适用于排队、已停止或废弃任务。
@@ -63,6 +65,9 @@ python run.py --cancel RUN_ID       # 释放锁并清理废弃 worktree
 | `--enqueue N` | 将 Issue 加入 SQLite 队列 |
 | `--run-next` | 有空闲并发槽时领取最早任务 |
 | `--resume RUN_ID` | 恢复失败或中断的任务 |
+| `--inspect RUN_ID` | 查看持久化元数据和结构化事件时间线 |
+| `--worker` | 启动轻量队列 worker，直到中断 |
+| `--worker-max-runs N` | worker 领取 N 个任务后停止（`0` 表示持续运行） |
 | `--keep-worktree` | 成功后保留任务 worktree |
 
 ## 工作流
@@ -109,6 +114,8 @@ agents/
 
 每个持久化任务拥有唯一 Run ID 和流程阶段。多个 Agent-Z 进程可在 `MAX_PARALLEL_TASKS` 限制内安全并行；SQLite 提供 Issue 锁，改动文件登记会在提交前阻止活跃任务之间的文件冲突。失败、中断和 `needs_human` 任务会保留 worktree，便于检查与恢复。
 
+结构化事件会写入 SQLite，覆盖队列、worker、阶段、状态、恢复、取消和文件声明等变化。远程或无人值守任务需要诊断时，可用 `python run.py --inspect RUN_ID` 查看时间线。
+
 ## 配置
 
 复制 `.env.example` 为 `.env` 后修改。全部选项：
@@ -140,6 +147,7 @@ agents/
 | `MAX_PARALLEL_TASKS` | 跨进程最大活跃任务数 | 2 |
 | `MAX_RUN_SECONDS` | 单次执行时间预算 | 21600 |
 | `CLEANUP_COMPLETED_WORKTREES` | 成功后删除 worktree | `true` |
+| `WORKER_IDLE_SLEEP` | 队列 worker 空闲时的 sleep 秒数 | 30 |
 
 旧变量 `CODERABBIT_POLL_INTERVAL` 和 `CODERABBIT_MAX_WAIT` 仍可作为兼容回退。
 

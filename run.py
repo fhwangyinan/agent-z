@@ -15,6 +15,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt, Confirm, IntPrompt
 from rich.table import Table
+from rich.text import Text
 
 AUTO_MODE = False
 TOTAL_LOOPS = 0
@@ -46,6 +47,7 @@ from config import (
     MAX_PARALLEL_TASKS,
     MAX_RUN_SECONDS,
     CLEANUP_COMPLETED_WORKTREES,
+    WORKER_IDLE_SLEEP,
 )
 
 
@@ -611,12 +613,122 @@ def show_runs(store: RunStore):
     console.print(table)
 
 
+def show_run_detail(store: RunStore, run_id: str):
+    record = store.get(run_id)
+    details = Table(title=f"Agent-Z run {run_id}", show_header=False)
+    details.add_column("Field", style="cyan")
+    details.add_column("Value")
+    rows = [
+        ("Issue", f"#{record.issue_number}"),
+        ("Repo", record.repo),
+        ("Status", record.status),
+        ("Stage", record.stage),
+        ("Risk", record.risk or ""),
+        ("Branch", record.branch or ""),
+        ("PR", record.pr_url or ""),
+        ("Worktree", record.worktree_path or ""),
+        ("Owner PID", str(record.owner_pid or "")),
+        ("Error", record.error or ""),
+        ("Created", record.created_at.replace("T", " ")[:19]),
+        ("Updated", record.updated_at.replace("T", " ")[:19]),
+    ]
+    for key, value in rows:
+        details.add_row(key, value)
+    console.print(details)
+
+    lines = []
+    for event in store.list_events(run_id):
+        data = json.dumps(event.data, ensure_ascii=True, sort_keys=True)
+        timestamp = event.created_at.replace("T", " ")[:19]
+        lines.append(
+            f"#{event.event_id} {timestamp} {event.event_type} "
+            f"status={event.status or '-'} stage={event.stage or '-'}"
+        )
+        if event.message:
+            lines.append(f"  message: {event.message}")
+        if data != "{}":
+            lines.append(f"  data: {data}")
+    console.print(Panel(Text("\n".join(lines) or "(no events)"), title="Events"))
+
+
 def cancel_run(store: RunStore, worktrees: WorktreeManager, run_id: str):
     record = store.cancel(run_id)
     if record.worktree_path:
         worktrees.remove(record.worktree_path)
         store.update(run_id, worktree_path=None)
     done(f"Cancelled run {run_id}")
+
+
+def run_worker(*, max_runs: int = 0, idle_sleep: int = WORKER_IDLE_SLEEP) -> int:
+    validate_environment()
+    show_banner()
+    store = RunStore(STATE_DB)
+    worktrees = WorktreeManager(PROJECT_DIR, WORKTREE_ROOT)
+    claimed = 0
+    store.add_event(
+        None,
+        "worker_started",
+        message="Worker started",
+        data={"max_runs": max_runs, "idle_sleep": idle_sleep},
+    )
+    done("Worker started")
+    while True:
+        record = store.claim_next(MAX_PARALLEL_TASKS)
+        if record is None:
+            log(f"No queued task available; sleeping {idle_sleep}s")
+            store.add_event(
+                None,
+                "worker_idle",
+                message="No queued task available",
+                data={"idle_sleep": idle_sleep},
+            )
+            time.sleep(idle_sleep)
+            continue
+
+        claimed += 1
+        store.add_event(
+            record.run_id,
+            "worker_run_started",
+            stage=record.stage,
+            status=record.status,
+            message="Worker started run",
+            data={"claimed": claimed},
+        )
+        analyst, developer, reviewer, submitter = _build_agents()
+        try:
+            execute_task(record, store, worktrees, analyst, developer, reviewer, submitter)
+            store.add_event(
+                record.run_id,
+                "worker_run_finished",
+                message="Worker finished run",
+                data={"claimed": claimed},
+            )
+        except KeyboardInterrupt:
+            store.add_event(
+                record.run_id,
+                "worker_interrupted",
+                message="Worker interrupted",
+                data={"claimed": claimed},
+            )
+            raise
+        except Exception as exc:
+            error(str(exc))
+            store.add_event(
+                record.run_id,
+                "worker_run_failed",
+                message=str(exc),
+                data={"claimed": claimed},
+            )
+
+        if max_runs and claimed >= max_runs:
+            done(f"Worker stopped after {claimed} claimed run(s)")
+            store.add_event(
+                None,
+                "worker_stopped",
+                message="Worker reached max_runs",
+                data={"claimed": claimed},
+            )
+            return claimed
 
 
 def main(target_issue: int | None = None, resume_id: str | None = None):
@@ -680,24 +792,44 @@ if __name__ == "__main__":
                       help="resume an existing run")
     mode.add_argument("--list-runs", action="store_true",
                       help="list recent persisted runs")
+    mode.add_argument("--inspect", metavar="RUN_ID",
+                      help="show a run and its structured event log")
     mode.add_argument("--cancel", metavar="RUN_ID",
                       help="cancel a run, release its lock, and remove its worktree")
+    mode.add_argument("--worker", action="store_true",
+                      help="continuously claim queued tasks and run them")
     parser.add_argument("--loop", type=int, default=0, metavar="N",
                         help="autonomous mode: run N rounds without confirmation")
     parser.add_argument("--force", action="store_true",
                         help="develop high-risk issues too")
     parser.add_argument("--keep-worktree", action="store_true",
                         help="keep a completed run's worktree")
+    parser.add_argument("--worker-max-runs", type=int, default=0, metavar="N",
+                        help="worker mode: stop after N claimed runs (0 = forever)")
+    parser.add_argument("--worker-idle-sleep", type=int, default=WORKER_IDLE_SLEEP, metavar="SECONDS",
+                        help="worker mode: sleep duration when no queued task is available")
     args = parser.parse_args()
-    if args.loop > 0 and any((args.issue, args.enqueue, args.run_next, args.resume, args.list_runs, args.cancel)):
+    if args.loop > 0 and any((
+        args.issue, args.enqueue, args.run_next, args.resume, args.list_runs,
+        args.inspect, args.cancel, args.worker,
+    )):
         parser.error("--loop cannot be combined with another run mode")
     if args.force and args.loop <= 0 and not args.issue and not args.resume and not args.run_next:
         parser.error("--force requires --loop, --issue, --resume, or --run-next")
+    if args.worker_max_runs < 0:
+        parser.error("--worker-max-runs must be zero or greater")
+    if args.worker_idle_sleep <= 0:
+        parser.error("--worker-idle-sleep must be positive")
+    if (args.worker_max_runs or args.worker_idle_sleep != WORKER_IDLE_SLEEP) and not args.worker:
+        parser.error("--worker-max-runs and --worker-idle-sleep require --worker")
 
     FORCE_DEVELOP = args.force
     KEEP_WORKTREE = args.keep_worktree
     if args.list_runs:
         show_runs(RunStore(STATE_DB))
+        raise SystemExit(0)
+    if args.inspect:
+        show_run_detail(RunStore(STATE_DB), args.inspect)
         raise SystemExit(0)
     if args.enqueue:
         record = RunStore(STATE_DB).enqueue(GITHUB_REPO, args.enqueue)
@@ -718,6 +850,10 @@ if __name__ == "__main__":
             raise SystemExit(1)
         AUTO_MODE = True
         main(resume_id=record.run_id)
+        raise SystemExit(0)
+    if args.worker:
+        AUTO_MODE = True
+        run_worker(max_runs=args.worker_max_runs, idle_sleep=args.worker_idle_sleep)
         raise SystemExit(0)
     if args.resume:
         AUTO_MODE = True

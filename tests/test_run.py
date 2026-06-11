@@ -179,5 +179,67 @@ class CancelRunTests(QuietRunTest):
         store.update.assert_called_once_with("run-1", worktree_path=None)
 
 
+class InspectTests(QuietRunTest):
+    def test_show_run_detail_reads_record_and_events(self):
+        store = Mock()
+        store.get.return_value = SimpleNamespace(
+            run_id="run-1",
+            issue_number=1,
+            repo="owner/repo",
+            status="completed",
+            stage="completed",
+            risk="low",
+            branch="agent-z/1-run-1",
+            pr_url="https://github.com/owner/repo/pull/1",
+            worktree_path=None,
+            owner_pid=None,
+            error=None,
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:01:00+00:00",
+        )
+        store.list_events.return_value = [
+            SimpleNamespace(
+                event_id=1,
+                created_at="2026-01-01T00:00:00+00:00",
+                event_type="run_created",
+                status="running",
+                stage="created",
+                message="Created",
+                data={"issue_number": 1},
+            )
+        ]
+        run.show_run_detail(store, "run-1")
+        store.get.assert_called_once_with("run-1")
+        store.list_events.assert_called_once_with("run-1")
+
+
+class WorkerTests(QuietRunTest):
+    @patch("run.execute_task")
+    @patch("run._build_agents", return_value=(Mock(), Mock(), Mock(), Mock()))
+    @patch("run.WorktreeManager")
+    @patch("run.RunStore")
+    @patch("run.validate_environment")
+    def test_worker_claims_one_task_and_stops(
+        self,
+        validate_environment,
+        store_class,
+        worktree_class,
+        build_agents,
+        execute_task,
+    ):
+        record = SimpleNamespace(run_id="run-1", stage="queued", status="running")
+        store = Mock()
+        store.claim_next.return_value = record
+        store_class.return_value = store
+        claimed = run.run_worker(max_runs=1, idle_sleep=1)
+        self.assertEqual(claimed, 1)
+        store.claim_next.assert_called_once()
+        execute_task.assert_called_once()
+        event_types = [call.args[1] for call in store.add_event.call_args_list]
+        self.assertIn("worker_started", event_types)
+        self.assertIn("worker_run_started", event_types)
+        self.assertIn("worker_stopped", event_types)
+
+
 if __name__ == "__main__":
     unittest.main()

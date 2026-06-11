@@ -53,6 +53,18 @@ class RunRecord:
     updated_at: str
 
 
+@dataclass
+class RunEvent:
+    event_id: int
+    run_id: str | None
+    event_type: str
+    stage: str | None
+    status: str | None
+    message: str | None
+    data: dict
+    created_at: str
+
+
 class RunStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
@@ -93,6 +105,26 @@ class RunStore:
                 )
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS run_events (
+                    event_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT,
+                    event_type TEXT NOT NULL,
+                    stage TEXT,
+                    status TEXT,
+                    message TEXT,
+                    data TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS run_events_run_id_created_at
+                ON run_events(run_id, created_at)
+                """
+            )
             connection.execute("DROP INDEX IF EXISTS active_issue_lock")
             connection.execute(
                 """
@@ -119,6 +151,82 @@ class RunStore:
         data["touched_files"] = json.loads(data["touched_files"] or "[]")
         return RunRecord(**data)
 
+    @staticmethod
+    def _event(row: sqlite3.Row) -> RunEvent:
+        data = dict(row)
+        data["data"] = json.loads(data["data"] or "{}")
+        return RunEvent(**data)
+
+    def _insert_event(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        run_id: str | None,
+        event_type: str,
+        stage: str | None = None,
+        status: str | None = None,
+        message: str | None = None,
+        data: dict | None = None,
+    ):
+        connection.execute(
+            """
+            INSERT INTO run_events (
+                run_id, event_type, stage, status, message, data, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                event_type,
+                stage,
+                status,
+                message,
+                json.dumps(data or {}, sort_keys=True),
+                _now(),
+            ),
+        )
+
+    def add_event(
+        self,
+        run_id: str | None,
+        event_type: str,
+        *,
+        stage: str | None = None,
+        status: str | None = None,
+        message: str | None = None,
+        data: dict | None = None,
+    ) -> RunEvent:
+        with self._connect() as connection:
+            self._insert_event(
+                connection,
+                run_id=run_id,
+                event_type=event_type,
+                stage=stage,
+                status=status,
+                message=message,
+                data=data,
+            )
+            event_id = connection.execute(
+                "SELECT last_insert_rowid()"
+            ).fetchone()[0]
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM run_events WHERE event_id = ?", (event_id,)
+            ).fetchone()
+        return self._event(row)
+
+    def list_events(self, run_id: str, limit: int = 100) -> list[RunEvent]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM run_events
+                WHERE run_id = ?
+                ORDER BY event_id ASC
+                LIMIT ?
+                """,
+                (run_id, limit),
+            ).fetchall()
+        return [self._event(row) for row in rows]
+
     def create(self, repo: str, issue_number: int, max_parallel: int) -> RunRecord:
         run_id = uuid.uuid4().hex[:12]
         timestamp = _now()
@@ -141,6 +249,15 @@ class RunStore:
                     """,
                     (run_id, repo, issue_number, os.getpid(), timestamp, timestamp),
                 )
+                self._insert_event(
+                    connection,
+                    run_id=run_id,
+                    event_type="run_created",
+                    stage="created",
+                    status="running",
+                    message=f"Created run for issue #{issue_number}",
+                    data={"repo": repo, "issue_number": issue_number},
+                )
         except sqlite3.IntegrityError as exc:
             raise RuntimeError(
                 f"issue #{issue_number} already has an active run"
@@ -160,6 +277,15 @@ class RunStore:
                     ) VALUES (?, ?, ?, 'queued', 'queued', '{}', ?, ?)
                     """,
                     (run_id, repo, issue_number, timestamp, timestamp),
+                )
+                self._insert_event(
+                    connection,
+                    run_id=run_id,
+                    event_type="run_enqueued",
+                    stage="queued",
+                    status="queued",
+                    message=f"Enqueued issue #{issue_number}",
+                    data={"repo": repo, "issue_number": issue_number},
                 )
         except sqlite3.IntegrityError as exc:
             raise RuntimeError(
@@ -190,6 +316,15 @@ class RunStore:
                 (os.getpid(), _now(), row["run_id"]),
             )
             run_id = row["run_id"]
+            self._insert_event(
+                connection,
+                run_id=run_id,
+                event_type="run_claimed",
+                stage="queued",
+                status="running",
+                message="Claimed queued run",
+                data={"owner_pid": os.getpid()},
+            )
         return self.get(run_id)
 
     def get(self, run_id: str) -> RunRecord:
@@ -228,9 +363,36 @@ class RunStore:
         assignments = ", ".join(f"{key} = ?" for key in fields)
         values = [*fields.values(), run_id]
         with self._connect() as connection:
+            previous = connection.execute(
+                "SELECT * FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if previous is None:
+                raise RuntimeError(f"run not found: {run_id}")
             connection.execute(
                 f"UPDATE runs SET {assignments} WHERE run_id = ?", values
             )
+            status = fields.get("status", previous["status"])
+            stage = fields.get("stage", previous["stage"])
+            visible_fields = {
+                key: value
+                for key, value in fields.items()
+                if key not in {"sessions", "updated_at"}
+            }
+            if visible_fields:
+                event_type = "run_updated"
+                if "stage" in fields and fields["stage"] != previous["stage"]:
+                    event_type = "stage_changed"
+                if "status" in fields and fields["status"] != previous["status"]:
+                    event_type = "status_changed"
+                self._insert_event(
+                    connection,
+                    run_id=run_id,
+                    event_type=event_type,
+                    stage=stage,
+                    status=status,
+                    message=None,
+                    data=visible_fields,
+                )
         return self.get(run_id)
 
     def claim_files(self, run_id: str, files: list[str]) -> RunRecord:
@@ -262,6 +424,15 @@ class RunStore:
             connection.execute(
                 "UPDATE runs SET touched_files = ?, updated_at = ? WHERE run_id = ?",
                 (json.dumps(sorted(requested)), _now(), run_id),
+            )
+            self._insert_event(
+                connection,
+                run_id=run_id,
+                event_type="files_claimed",
+                stage=record.stage,
+                status=record.status,
+                message=f"Claimed {len(requested)} changed file(s)",
+                data={"files": sorted(requested)},
             )
         return self.get(run_id)
 
@@ -306,6 +477,15 @@ class RunStore:
                     """,
                     (os.getpid(), _now(), run_id),
                 )
+                self._insert_event(
+                    connection,
+                    run_id=run_id,
+                    event_type="run_resumed",
+                    stage=current.stage,
+                    status="running",
+                    message="Resumed run",
+                    data={"owner_pid": os.getpid(), "previous_status": current.status},
+                )
         except sqlite3.IntegrityError as exc:
             raise RuntimeError(
                 f"issue #{record.issue_number} already has another active run"
@@ -336,5 +516,14 @@ class RunStore:
                 WHERE run_id = ?
                 """,
                 (_now(), run_id),
+            )
+            self._insert_event(
+                connection,
+                run_id=run_id,
+                event_type="run_cancelled",
+                stage="cancelled",
+                status="cancelled",
+                message="Cancelled run",
+                data={"previous_status": current.status},
             )
         return self.get(run_id)
