@@ -1,4 +1,3 @@
-# Agent 基础类
 import re
 import subprocess
 import sys
@@ -8,13 +7,29 @@ from datetime import datetime
 from rich.console import Console
 from rich.markup import escape
 
-from .runners import ClaudeRunner, AgentRunner
-from config import PROJECT_DIR, GITHUB_REPO, CLAUDE_FLAGS, RETRY_TIMEOUT
+from .runners import AgentRunner, ClaudeRunner, CodexRunner, OpenCodeRunner
+from config import (
+    PROJECT_DIR,
+    GITHUB_REPO,
+    CLAUDE_FLAGS,
+    CODEX_FLAGS,
+    OPENCODE_FLAGS,
+    RETRY_TIMEOUT,
+)
 
 console = Console()
 
-# 默认 Runner（切换其他 Agent 只需替换这里）
-DEFAULT_RUNNER = ClaudeRunner(flags=CLAUDE_FLAGS, retry_timeout=RETRY_TIMEOUT)
+def create_runner(name: str) -> AgentRunner:
+    runners = {
+        "claude": lambda: ClaudeRunner(flags=CLAUDE_FLAGS, retry_timeout=RETRY_TIMEOUT),
+        "codex": lambda: CodexRunner(flags=CODEX_FLAGS, retry_timeout=RETRY_TIMEOUT),
+        "opencode": lambda: OpenCodeRunner(flags=OPENCODE_FLAGS, retry_timeout=RETRY_TIMEOUT),
+    }
+    try:
+        return runners[name.lower()]()
+    except KeyError as exc:
+        supported = ", ".join(sorted(runners))
+        raise ValueError(f"Unknown backend {name!r}. Supported backends: {supported}") from exc
 
 AGENT_ICONS = {
     "Analyst":   "A",
@@ -88,22 +103,28 @@ def agent_status(name: str, action: str):
 
 
 class Agent:
-    def __init__(self, name: str, runner: AgentRunner | None = None):
+    def __init__(self, name: str, backend: str, runner: AgentRunner | None = None):
         self.name = name
         self.color = AGENT_COLORS.get(name, "white")
-        self.runner = runner or DEFAULT_RUNNER
+        self.runner = runner or create_runner(backend)
+        self.session_id: str | None = None
 
-    def run(self, prompt: str, timeout: int = 600, continue_session: bool = False) -> str:
-        mode = "continue" if continue_session else "new"
+    def reset_session(self):
+        self.session_id = None
+
+    def run(self, prompt: str, timeout: int = 600, resume_session: bool = False) -> str:
+        session_id = self.session_id if resume_session else None
+        mode = f"{self.runner.name}:{'resume' if session_id else 'new'}"
         with agent_status(self.name, mode):
-            output = self.runner.execute(
+            result = self.runner.execute(
                 prompt=prompt,
                 timeout=timeout,
                 cwd=PROJECT_DIR,
-                continue_session=continue_session,
+                session_id=session_id,
             )
+        self.session_id = result.session_id
         done(f"[{self.color}]{self.name}[/{self.color}] done")
-        return output
+        return result.output
 
     def extract(self, text: str, pattern: str, default=None):
         match = re.search(pattern, text)

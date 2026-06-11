@@ -1,12 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Multi-Agent 自动 Issue 修复 - TUI 版
-
-Usage:
-  python run.py                交互模式，每轮确认
-  python run.py --loop 5       自动模式，跑 5 轮，无需确认
-"""
+"""Multi-agent automated issue fixing with a lightweight TUI."""
 
 import argparse
 import json
@@ -30,6 +24,7 @@ CURRENT_LOOP = 0
 FORCE_DEVELOP = False
 
 from agents.base import log, step, done, warn, error, run_cmd, PROJECT_DIR, GITHUB_REPO
+from agents import __version__
 from agents.analyst import AnalystAgent
 from agents.developer import DeveloperAgent
 from agents.reviewer import ReviewerAgent
@@ -38,6 +33,10 @@ from agents.submitter import SubmitterAgent
 console = Console()
 
 from config import (
+    ANALYST_BACKEND,
+    DEVELOPER_BACKEND,
+    REVIEWER_BACKEND,
+    SUBMITTER_BACKEND,
     PR_CHECKS_INTERVAL,
     PR_CHECKS_MAX_WAIT,
     MAX_REVIEW_ROUNDS,
@@ -49,8 +48,10 @@ def show_banner():
     console.print()
     console.print(Align.center(
         Panel.fit(
-            "[bold cyan]Multi-Agent Issue Fix[/bold cyan]\n"
-            f"[dim]Target: {GITHUB_REPO}[/dim]",
+            f"[bold cyan]Agent-Z v{__version__}[/bold cyan]\n"
+            f"[dim]Target: {GITHUB_REPO} | "
+            f"A:{ANALYST_BACKEND} D:{DEVELOPER_BACKEND} "
+            f"R:{REVIEWER_BACKEND} S:{SUBMITTER_BACKEND}[/dim]",
             border_style="cyan",
             padding=(0, 8),
         )
@@ -65,7 +66,17 @@ def validate_environment():
         raise RuntimeError(f"PROJECT_DIR does not exist: {PROJECT_DIR}")
     if not GITHUB_REPO or "/" not in GITHUB_REPO:
         raise RuntimeError(f"GITHUB_REPO must use owner/repo format, got {GITHUB_REPO!r}")
-    for command in ("git", "gh", "claude"):
+    selected_backends = {
+        ANALYST_BACKEND,
+        DEVELOPER_BACKEND,
+        REVIEWER_BACKEND,
+        SUBMITTER_BACKEND,
+    }
+    supported_backends = {"claude", "codex", "opencode"}
+    unknown = selected_backends - supported_backends
+    if unknown:
+        raise RuntimeError(f"unsupported agent backend(s): {', '.join(sorted(unknown))}")
+    for command in ("git", "gh", *sorted(selected_backends)):
         if not shutil.which(command):
             raise RuntimeError(f"required command not found: {command}")
     result = run_cmd(["git", "rev-parse", "--is-inside-work-tree"], check=False)
@@ -86,7 +97,7 @@ def _find_stash_ref(message: str) -> str | None:
 
 @contextmanager
 def managed_environment():
-    step("📦 准备环境")
+    step("📦 Prepare environment")
     original_branch = run_cmd(
         ["git", "symbolic-ref", "--short", "-q", "HEAD"], check=False
     ).stdout.strip()
@@ -96,7 +107,7 @@ def managed_environment():
 
     status = run_cmd(["git", "status", "--short"], check=False)
     if status.stdout.strip():
-        log("储藏未提交变更...")
+        log("Stashing local changes...")
         result = run_cmd(["git", "stash", "push", "-u", "-m", stash_message], check=False)
         created_stash = result.returncode == 0 and _find_stash_ref(stash_message) is not None
         if not created_stash:
@@ -105,26 +116,26 @@ def managed_environment():
     try:
         run_cmd(["git", "checkout", "main"])
         run_cmd(["git", "pull", "origin", "main"], verbose=True)
-        done("环境就绪")
+        done("Environment ready")
         yield
     finally:
-        step("📦 恢复原始工作区")
+        step("📦 Restore original workspace")
         checkout = run_cmd(["git", "checkout", original_ref], check=False)
         if checkout.returncode != 0:
-            warn("无法切回原始分支/提交；保留自动 stash，避免覆盖当前修改")
+            warn("Could not restore the original ref; the automatic stash was preserved")
         elif created_stash:
             stash_ref = _find_stash_ref(stash_message)
             if not stash_ref:
-                warn("未找到本轮自动 stash，请检查 git stash list")
+                warn("Could not find the automatic stash; inspect `git stash list`")
             else:
                 applied = run_cmd(["git", "stash", "apply", stash_ref], check=False)
                 if applied.returncode != 0:
-                    warn(f"恢复本地修改发生冲突，已保留 {stash_ref}")
+                    warn(f"Restoring local changes caused conflicts; preserved {stash_ref}")
                 else:
                     run_cmd(["git", "stash", "drop", stash_ref], check=False)
-                    done("原始工作区已恢复")
+                    done("Original workspace restored")
         else:
-            done("原始工作区已恢复")
+            done("Original workspace restored")
 
 
 def _get_pr_checks(pr_url: str) -> list[dict] | None:
@@ -147,24 +158,24 @@ def _get_pr_checks(pr_url: str) -> list[dict] | None:
 
 
 def wait_for_pr_checks(pr_url: str) -> bool:
-    step("✅ 等待 PR Checks")
+    step("✅ Wait for PR checks")
     deadline = time.monotonic() + PR_CHECKS_MAX_WAIT
     checks = _get_pr_checks(pr_url)
     while checks == [] and time.monotonic() < deadline:
-        log("[dim]Checks 尚未注册，稍后重试...[/dim]")
+        log("[dim]No checks reported yet; retrying...[/dim]")
         time.sleep(min(PR_CHECKS_INTERVAL, max(0, deadline - time.monotonic())))
         checks = _get_pr_checks(pr_url)
 
     if checks is None:
-        warn("无法查询 PR Checks")
+        warn("Could not query PR checks")
         return False
     if not checks:
-        warn("等待超时，PR Checks 仍未注册")
+        warn("Timed out before PR checks were reported")
         return False
 
     remaining = max(1, int(deadline - time.monotonic()))
     try:
-        with console.status("[dim]gh pr checks --watch 运行中...[/dim]", spinner="dots"):
+        with console.status("[dim]Watching PR checks...[/dim]", spinner="dots"):
             run_cmd(
                 [
                     "gh", "pr", "checks", pr_url, "--watch",
@@ -175,22 +186,22 @@ def wait_for_pr_checks(pr_url: str) -> bool:
                 verbose=True,
             )
     except subprocess.TimeoutExpired:
-        warn("等待 PR Checks 超时")
+        warn("Timed out while waiting for PR checks")
         return False
 
     checks = _get_pr_checks(pr_url)
     if checks is None:
-        warn("无法确认 PR Checks 最终状态")
+        warn("Could not confirm final PR check status")
         return False
     if not checks or any(check.get("bucket") == "pending" for check in checks):
-        warn("PR Checks 尚未全部结束")
+        warn("PR checks are still pending")
         return False
 
     failed = [check.get("name", "(unnamed)") for check in checks if check.get("bucket") == "fail"]
     if failed:
-        warn(f"PR Checks 完成，失败项: {', '.join(failed)}")
+        warn(f"PR checks completed with failures: {', '.join(failed)}")
     else:
-        done("PR Checks 已全部结束")
+        done("All PR checks completed")
     return True
 
 
@@ -202,20 +213,20 @@ def _get_issue_title(issue_number: int) -> str:
         )
         if result.returncode == 0 and result.stdout.strip():
             data = json.loads(result.stdout)
-            title = data.get("title", "(无标题)")
+            title = data.get("title", "(untitled)")
             labels = "  ".join(f"[{l['name']}]" for l in data.get("labels", []))
             return f"{title}\n[dim]{labels}[/dim]" if labels else title
     except Exception:
         pass
-    return "(无法获取标题)"
+    return "(unable to fetch title)"
 
 
 def choose_issue() -> int | None:
     console.print()
     if AUTO_MODE:
-        loop_info = f" (第 {CURRENT_LOOP}/{TOTAL_LOOPS} 轮)" if TOTAL_LOOPS > 1 else ""
+        loop_info = f" (round {CURRENT_LOOP}/{TOTAL_LOOPS})" if TOTAL_LOOPS > 1 else ""
         console.print(Panel(
-            f"[bold]自动模式：Agent 自主推荐 issue{loop_info}[/bold]",
+            f"[bold]Autonomous mode: Agent selects an issue{loop_info}[/bold]",
             border_style="cyan",
         ))
         return None
@@ -223,14 +234,14 @@ def choose_issue() -> int | None:
     table = Table(show_header=False, box=None, padding=(0, 4))
     table.add_column(style="cyan")
     table.add_column()
-    table.add_row("[bold][1][/bold]", "让 Agent 自动分析并推荐最优先的 issue")
-    table.add_row("[bold][2][/bold]", "手动指定 issue 编号")
-    console.print(Panel(table, title="[bold]选择模式[/bold]", border_style="cyan"))
+    table.add_row("[bold][1][/bold]", "Let the Agent recommend the highest-priority issue")
+    table.add_row("[bold][2][/bold]", "Enter an issue number")
+    console.print(Panel(table, title="[bold]Select mode[/bold]", border_style="cyan"))
     choice = Prompt.ask("", choices=["1", "2"], default="1")
     if choice == "1":
         return None
     else:
-        return IntPrompt.ask("请输入 Issue 编号")
+        return IntPrompt.ask("Issue number")
 
 
 def confirm_issue(issue_number: int) -> int | None:
@@ -239,7 +250,7 @@ def confirm_issue(issue_number: int) -> int | None:
         title,
         title=f"[bold green]#{issue_number}[/bold green]",
         border_style="green",
-        subtitle="确认? (y/n 或输入其他编号)",
+        subtitle="Confirm? (y/n or another issue number)",
         subtitle_align="left",
     ))
 
@@ -248,22 +259,22 @@ def confirm_issue(issue_number: int) -> int | None:
 
     while True:
         user_input = Prompt.ask("", default="y").strip()
-        if user_input.lower() in ("y", "yes", "是", ""):
+        if user_input.lower() in ("y", "yes", ""):
             return issue_number
-        elif user_input.lower() in ("n", "no", "否"):
+        elif user_input.lower() in ("n", "no"):
             return None
         elif user_input.isdigit():
             new_num = int(user_input)
             title = _get_issue_title(new_num)
-            console.print(f"  → 切换至 [bold]#{new_num}[/bold]")
+            console.print(f"  → Switched to [bold]#{new_num}[/bold]")
             console.print(Panel(title, title=f"[bold green]#{new_num}[/bold green]", border_style="green"))
             return new_num
         else:
-            warn("无效输入")
+            warn("Invalid input")
 
 
 def show_analysis(issue_number: int, analysis: str):
-    """用 Panel 展示分析结果"""
+    """Display the analysis in a panel."""
     display = analysis[:2000] + ("..." if len(analysis) > 2000 else "")
     console.print(Panel(display, title=f"[bold cyan]🔍 Analyst → Issue #{issue_number}[/bold cyan]", border_style="blue"))
 
@@ -277,18 +288,23 @@ def run_local_review(
 ) -> bool:
     for local_round in range(MAX_LOCAL_REVIEW_ROUNDS):
         if follow_up:
-            step(f"👁 本地 Reviewer 复查 (第 {local_round + 1} 轮)")
-        review_comments = reviewer.review(issue_number, continue_session=True)
+            step(f"👁 Local Reviewer follow-up (round {local_round + 1})")
+        review_comments = reviewer.review(issue_number, resume_session=True)
         if not review_comments:
-            done("Reviewer 通过 (LGTM)")
+            done("Reviewer approved (LGTM)")
             return True
 
-        warn(f"Reviewer 发现 [bold]{len(review_comments)}[/bold] 条问题 (第 {local_round + 1} 轮)")
+        warn(f"Reviewer found [bold]{len(review_comments)}[/bold] issue(s) (round {local_round + 1})")
         for i, comment in enumerate(review_comments, 1):
             console.print(f"    [yellow]{i}.[/yellow] {comment[:300]}")
-        developer.apply_review(issue_number, "", continue_session=True)
+        developer.apply_review(
+            issue_number,
+            "",
+            review_comments=review_comments,
+            resume_session=True,
+        )
 
-    warn(f"达到本地 Review 最大轮次 ({MAX_LOCAL_REVIEW_ROUNDS})，停止当前流程")
+    warn(f"Reached the local review limit ({MAX_LOCAL_REVIEW_ROUNDS}); stopping this run")
     return False
 
 
@@ -298,62 +314,65 @@ def run_round(
     reviewer: ReviewerAgent,
     submitter: SubmitterAgent,
 ) -> bool:
+    for agent in (analyst, developer, reviewer, submitter):
+        agent.reset_session()
+
     with managed_environment():
         target = choose_issue()
 
-        step("🔍 Analyst 分析")
+        step("🔍 Analyst")
         if target:
-            issue_number, analysis = analyst.analyze(target_issue=target, continue_session=False)
+            issue_number, analysis = analyst.analyze(target_issue=target, resume_session=False)
         else:
-            issue_number, analysis = analyst.analyze(continue_session=False)
+            issue_number, analysis = analyst.analyze(resume_session=False)
 
         if issue_number is None:
-            error("Analyst 未能推荐 issue")
+            error("Analyst did not recommend an issue")
             return False
 
         show_analysis(issue_number, analysis)
         issue_number = confirm_issue(issue_number)
         if issue_number is None:
-            log("跳过，下一轮")
+            log("Skipped; moving to the next round")
             return False
 
-        step("🔍 影响评估")
-        impact, risk = analyst.assess_impact(issue_number, continue_session=True)
-        console.print(Panel(impact[:2500], title=f"影响评估 [yellow]风险: {risk}[/yellow]", border_style="yellow"))
+        step("🔍 Impact assessment")
+        impact, risk = analyst.assess_impact(issue_number, resume_session=True)
+        console.print(Panel(impact[:2500], title=f"Impact assessment [yellow]risk: {risk}[/yellow]", border_style="yellow"))
 
         if AUTO_MODE and not FORCE_DEVELOP:
             if risk in ("high", "very_high"):
-                warn(f"风险 [{risk}]，自动跳过 → 换下一个 issue")
+                warn(f"Risk is [{risk}]; skipping automatically")
                 return False
         else:
-            console.print("\n[dim]风险: [bold]{0}[/bold]  |  输入问题追问  |  [bold]skip[/bold] 换 issue  |  [bold]done[/bold]/回车 开始开发[/dim]".format(risk))
+            console.print("\n[dim]Risk: [bold]{0}[/bold] | ask a question | [bold]skip[/bold] issue | [bold]done[/bold]/Enter to develop[/dim]".format(risk))
             while True:
                 question = Prompt.ask("", default="").strip()
                 if not question:
                     break
                 if question.lower() in ("skip", "s"):
-                    log("用户跳过 → 换下一个 issue")
+                    log("Issue skipped by user")
                     return False
                 if question.lower() in ("done", "ok", "go", "y"):
                     break
                 answer = analyst.chat(question)
                 console.print(Panel(answer[:2000], border_style="dim"))
 
-        step("🔧 Developer 修复")
-        developer.fix(issue_number, continue_session=True)
+        step("🔧 Developer")
+        developer.fix(issue_number, resume_session=False)
 
-        step("👁 Reviewer 本地预审")
+        step("👁 Local Reviewer")
         if not run_local_review(issue_number, reviewer, developer):
             return False
 
-        step("🚀 Submitter 创建 PR")
-        pr_url = submitter.submit(issue_number, continue_session=True)
+        step("🚀 Submitter")
+        pr_url = submitter.submit(issue_number, resume_session=False)
         if not pr_url:
-            error("Submitter 未能创建 PR")
+            error("Submitter did not create a PR")
             return False
         console.print(Panel(
             f"[link={pr_url}]{pr_url}[/link]",
-            title="[bold green]🚀 PR 已创建[/bold green]",
+            title="[bold green]🚀 PR created[/bold green]",
             border_style="green",
         ))
 
@@ -361,22 +380,22 @@ def run_round(
             if not wait_for_pr_checks(pr_url):
                 return False
 
-            step(f"🔧 Developer 处理 PR 反馈 (第 {review_count + 1}/{MAX_REVIEW_ROUNDS} 轮)")
-            dev_output = developer.apply_review(issue_number, pr_url, continue_session=True)
+            step(f"🔧 Developer handles PR feedback (round {review_count + 1}/{MAX_REVIEW_ROUNDS})")
+            dev_output = developer.apply_review(issue_number, pr_url, resume_session=True)
             if "NO_ACTION_NEEDED" in dev_output.upper():
-                done("Developer 判断无需修改 → 结束")
+                done("Developer reported no action needed")
                 break
 
             if not run_local_review(issue_number, reviewer, developer, follow_up=True):
                 return False
-            done("本地 Reviewer 通过 → push")
-            developer.push_and_notify(pr_url, continue_session=True)
+            done("Local Reviewer approved; pushing")
+            developer.push_and_notify(pr_url, resume_session=True)
         else:
-            warn(f"达到最大 Review 轮次 ({MAX_REVIEW_ROUNDS})，停止当前流程")
+            warn(f"Reached the PR feedback limit ({MAX_REVIEW_ROUNDS}); stopping this run")
             return False
 
         console.print(Panel(
-            f"[bold green]✅ Issue #{issue_number} 处理完成[/bold green]\n[dim]{pr_url}[/dim]",
+            f"[bold green]✅ Issue #{issue_number} completed[/bold green]\n[dim]{pr_url}[/dim]",
             border_style="green",
         ))
         return True
@@ -395,7 +414,7 @@ def main():
             run_round(analyst, developer, reviewer, submitter)
 
         except KeyboardInterrupt:
-            console.print("\n[yellow]用户中断[/yellow]")
+            console.print("\n[yellow]Interrupted by user[/yellow]")
             break
         except Exception as e:
             error(str(e))
@@ -405,17 +424,17 @@ def main():
         console.print()
         if AUTO_MODE:
             break
-        if not Confirm.ask("[bold]是否进入下一轮?[/bold]", default=True):
-            done("脚本退出")
+        if not Confirm.ask("[bold]Start another round?[/bold]", default=True):
+            done("Exiting")
             break
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Multi-Agent 自动 Issue 修复")
+    parser = argparse.ArgumentParser(description="Multi-agent automated issue fixing")
     parser.add_argument("--loop", type=int, default=0, metavar="N",
-                        help="自动模式：跑 N 轮，跳过所有确认")
+                        help="autonomous mode: run N rounds without confirmation")
     parser.add_argument("--force", action="store_true",
-                        help="即便高风险也继续开发（需配合 --loop）")
+                        help="develop high-risk issues too (requires --loop)")
     args = parser.parse_args()
     if args.force and args.loop <= 0:
         parser.error("--force requires --loop N")
@@ -424,12 +443,12 @@ if __name__ == "__main__":
         AUTO_MODE = True
         TOTAL_LOOPS = args.loop
         FORCE_DEVELOP = args.force
-        console.print(f"[bold cyan]自动模式[/bold cyan] [dim]共 {TOTAL_LOOPS} 轮[/dim]")
+        console.print(f"[bold cyan]Autonomous mode[/bold cyan] [dim]{TOTAL_LOOPS} round(s)[/dim]")
         if FORCE_DEVELOP:
-            console.print("[yellow]⚠ 强制模式：忽略风险级别[/yellow]")
+            console.print("[yellow]⚠ Force mode: risk levels are ignored[/yellow]")
         for i in range(TOTAL_LOOPS):
             CURRENT_LOOP = i + 1
             main()
-        done(f"全部 {TOTAL_LOOPS} 轮完成")
+        done(f"Completed all {TOTAL_LOOPS} round(s)")
     else:
         main()

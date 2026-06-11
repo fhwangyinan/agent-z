@@ -87,6 +87,10 @@ class LocalReviewTests(QuietRunTest):
         with patch("run.MAX_LOCAL_REVIEW_ROUNDS", 2):
             self.assertFalse(run.run_local_review(1, reviewer, developer))
         self.assertEqual(developer.apply_review.call_count, 2)
+        self.assertEqual(
+            developer.apply_review.call_args.kwargs["review_comments"],
+            ["still broken"],
+        )
 
 
 class RoundFlowTests(QuietRunTest):
@@ -111,6 +115,10 @@ class RoundFlowTests(QuietRunTest):
         submitter = Mock()
         with patch("run.AUTO_MODE", True):
             self.assertFalse(run.run_round(analyst, developer, reviewer, submitter))
+        analyst.reset_session.assert_called_once()
+        developer.reset_session.assert_called_once()
+        reviewer.reset_session.assert_called_once()
+        submitter.reset_session.assert_called_once()
         submitter.submit.assert_not_called()
 
 
@@ -118,6 +126,17 @@ class ValidationTests(QuietRunTest):
     @patch("run.os.path.isdir", return_value=False)
     def test_missing_project_directory_fails_fast(self, isdir):
         with self.assertRaisesRegex(RuntimeError, "PROJECT_DIR does not exist"):
+            run.validate_environment()
+
+    @patch("run.run_cmd", return_value=result(stdout="true\n"))
+    @patch("run.shutil.which")
+    @patch("run.os.path.isdir", return_value=True)
+    def test_only_selected_backends_are_required(self, isdir, which, run_cmd):
+        which.side_effect = lambda command: None if command == "opencode" else command
+        with patch("run.ANALYST_BACKEND", "claude"), \
+             patch("run.DEVELOPER_BACKEND", "claude"), \
+             patch("run.REVIEWER_BACKEND", "codex"), \
+             patch("run.SUBMITTER_BACKEND", "claude"):
             run.validate_environment()
 
 

@@ -1,5 +1,4 @@
-# 从 .env 文件加载配置，未设置的项使用默认值
-# .env 不做版本管理，参见 .env.example
+# Load configuration from .env. Unset values use defaults.
 
 import os
 import shlex
@@ -8,7 +7,7 @@ _BASE = os.path.dirname(os.path.abspath(__file__))
 
 
 def _load_dotenv():
-    """简单解析 .env，不依赖外部库"""
+    """Parse a small .env file without an external dependency."""
     env_path = os.path.join(_BASE, ".env")
     if not os.path.exists(env_path):
         return
@@ -49,22 +48,30 @@ def _get_positive_int(key: str, default: int, fallback_key: str | None = None) -
     return value
 
 
-# ---- 项目配置 ----
+# ---- Project ----
 PROJECT_DIR = _get("PROJECT_DIR", r"G:\Code\workspace_aieng")
 GITHUB_REPO = _get("GITHUB_REPO", "armpro24-blip/cad-cae-copilot")
 
-# ---- Claude Runner 配置 ----
-CLAUDE_FLAGS = shlex.split(_get("CLAUDE_FLAGS", "--dangerously-skip-permissions"))
+# ---- Agent backends ----
+DEFAULT_BACKEND = _get("DEFAULT_BACKEND", "claude").lower()
+ANALYST_BACKEND = _get("ANALYST_BACKEND", DEFAULT_BACKEND).lower()
+DEVELOPER_BACKEND = _get("DEVELOPER_BACKEND", DEFAULT_BACKEND).lower()
+REVIEWER_BACKEND = _get("REVIEWER_BACKEND", DEFAULT_BACKEND).lower()
+SUBMITTER_BACKEND = _get("SUBMITTER_BACKEND", DEFAULT_BACKEND).lower()
 
-# ---- 超时配置 (秒) ----
+CLAUDE_FLAGS = shlex.split(_get("CLAUDE_FLAGS", "--dangerously-skip-permissions"))
+CODEX_FLAGS = shlex.split(_get("CODEX_FLAGS", "--dangerously-bypass-approvals-and-sandbox"))
+OPENCODE_FLAGS = shlex.split(_get("OPENCODE_FLAGS", ""))
+
+# ---- Timeouts (seconds) ----
 TIMEOUT_ANALYST = _get_positive_int("TIMEOUT_ANALYST", 3600)
 TIMEOUT_DEVELOPER = _get_positive_int("TIMEOUT_DEVELOPER", 10800)
 TIMEOUT_REVIEWER = _get_positive_int("TIMEOUT_REVIEWER", 1800)
 TIMEOUT_SUBMITTER = _get_positive_int("TIMEOUT_SUBMITTER", 600)
 RETRY_TIMEOUT = _get_positive_int("RETRY_TIMEOUT", 3600)
 
-# ---- PR Checks 配置 ----
-# 旧的 CODERABBIT_* 名称保留为兼容回退。
+# ---- PR checks ----
+# Legacy CODERABBIT_* names remain supported as fallbacks.
 PR_CHECKS_INTERVAL = _get_positive_int(
     "PR_CHECKS_INTERVAL", 10, fallback_key="CODERABBIT_POLL_INTERVAL"
 )

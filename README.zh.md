@@ -2,9 +2,9 @@
 
 [English](README.md)
 
-轻量级 coding-agent 驱动脚本，实现自主开发循环。
+轻量级、后端无关的 coding-agent 自动化工具，实现自主开发循环。
 
-通过 Claude Code 驱动多个专项 Agent，构成全自动闭环：挑选 issue → 影响评估 → 修复代码 → 本地审查 → 提 PR → 等待并迭代 PR Checks 反馈。
+通过 Claude Code、Codex 或 OpenCode 驱动多个专项 Agent，构成全自动闭环：挑选 issue → 影响评估 → 修复代码 → 本地审查 → 提 PR → 等待并迭代 PR Checks 反馈。
 
 ```
 Analyst → 影响评估 → Developer → Reviewer → Submitter → PR Checks → Developer → ...
@@ -14,7 +14,7 @@ Analyst → 影响评估 → Developer → Reviewer → Submitter → PR Checks 
 
 - Python 3.11+
 - [GitHub CLI](https://cli.github.com/) (`gh`) 已认证
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`) 已安装
+- 至少安装一个受支持的 coding-agent CLI：`claude`、`codex` 或 `opencode`
 - 可选：目标仓库安装 [CodeRabbitAI](https://coderabbit.ai/) GitHub App
 
 ## 安装
@@ -65,8 +65,8 @@ python run.py --loop 5 --force      # 自主模式：忽略风险级别，全部
    - `very_high` — 破坏性变更（改变流程/输出）→ 自动跳过
    - 已有评估则追加更新，不重复创建
 3. **交互问答**（仅交互模式）— 就影响评估与 Analyst 对话；`skip` 换 issue
-4. **开发修复** — 修复代码（通过 `--continue` 复用 Analyst 上下文）
-5. **本地审查** — 本地 Code Review (git diff + 测试)；Developer 修复反馈
+4. **开发修复** — 在目标工作区修复代码
+5. **本地审查** — 独立 Reviewer 审查；发现的问题显式交给 Developer 修复
 6. **提交 PR** — 创建分支、commit、push、创建 PR
 7. **PR Checks** — 使用 `gh pr checks --watch` 等待全部 checks → Developer 读取 CI 与 review 反馈 → 修复 → 本地 Reviewer 复查通过 → push → 循环直到无需修改
 
@@ -82,11 +82,13 @@ agents/
   reviewer.py             本地 Code Review (diff + 测试)
   submitter.py            分支、commit、push、PR
   runners/
-    base.py               抽象 AgentRunner 接口
-    claude.py             ClaudeRunner — claude -p 后端
+    base.py               后端契约、能力声明与 AgentResult
+    claude.py             Claude Code 适配器，支持显式 session 恢复
+    codex.py              Codex CLI 适配器，解析 JSONL 事件
+    opencode.py           OpenCode 适配器，解析 JSON 事件
 ```
 
-所有 Agent 通过 `--continue` 共享同一个 session，上下文自然流转，无需重复读代码。
+每个角色持有独立后端 session。Analyst、Developer、Reviewer 和 Submitter 可以使用不同 CLI；角色间通过工作区、GitHub Issue、PR 反馈与显式 Review findings 传递上下文，不依赖隐式 latest session。
 
 ## 配置
 
@@ -96,7 +98,14 @@ agents/
 |------|------|--------|
 | `PROJECT_DIR` | 目标项目路径 | — |
 | `GITHUB_REPO` | 目标仓库 (owner/repo) | — |
+| `DEFAULT_BACKEND` | 默认后端：`claude`、`codex` 或 `opencode` | `claude` |
+| `ANALYST_BACKEND` | Analyst 后端覆盖 | `DEFAULT_BACKEND` |
+| `DEVELOPER_BACKEND` | Developer 后端覆盖 | `DEFAULT_BACKEND` |
+| `REVIEWER_BACKEND` | Reviewer 后端覆盖 | `DEFAULT_BACKEND` |
+| `SUBMITTER_BACKEND` | Submitter 后端覆盖 | `DEFAULT_BACKEND` |
 | `CLAUDE_FLAGS` | Claude 参数 | `--dangerously-skip-permissions` |
+| `CODEX_FLAGS` | Codex 参数 | `--dangerously-bypass-approvals-and-sandbox` |
+| `OPENCODE_FLAGS` | OpenCode 参数 | — |
 | `TIMEOUT_ANALYST` | Analyst 超时 (秒) | 3600 |
 | `TIMEOUT_DEVELOPER` | Developer 超时 (秒) | 10800 |
 | `TIMEOUT_REVIEWER` | Reviewer 超时 (秒) | 1800 |
@@ -109,17 +118,21 @@ agents/
 
 旧变量 `CODERABBIT_POLL_INTERVAL` 和 `CODERABBIT_MAX_WAIT` 仍可作为兼容回退。
 
-## 自定义 Agent 后端
+## 后端选择
 
-实现 `AgentRunner` 接口即可切换 LLM：
+全部角色使用同一后端：
 
-```python
-from agents.runners.base import AgentRunner
-
-class CustomRunner(AgentRunner):
-    def execute(self, prompt, timeout, cwd, continue_session):
-        ...
-
-# agents/base.py
-DEFAULT_RUNNER = CustomRunner()
+```env
+DEFAULT_BACKEND=codex
 ```
+
+也可以混合使用并保持 session 隔离：
+
+```env
+ANALYST_BACKEND=claude
+DEVELOPER_BACKEND=claude
+REVIEWER_BACKEND=codex
+SUBMITTER_BACKEND=claude
+```
+
+启动时仅要求已选中的后端命令可用。若配置了 `opencode` 但命令不在 `PATH`，Agent-Z 会快速失败并给出明确错误。

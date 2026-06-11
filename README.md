@@ -2,9 +2,9 @@
 
 [中文文档](README.zh.md)
 
-Lightweight coding-agent-driven automation for autonomous development loops.
+Lightweight, backend-agnostic coding-agent automation for autonomous development loops.
 
-Agent-Z orchestrates multiple specialized agents powered by Claude Code, forming a fully autonomous cycle: pick issue → assess impact → fix code → review locally → open PR → wait for and iterate on PR checks.
+Agent-Z orchestrates specialized agents powered by Claude Code, Codex, or OpenCode, forming a fully autonomous cycle: pick issue → assess impact → fix code → review locally → open PR → wait for and iterate on PR checks.
 
 ```
 Analyst → Impact Assessment → Developer → Reviewer → Submitter → PR Checks → Developer → ...
@@ -14,7 +14,7 @@ Analyst → Impact Assessment → Developer → Reviewer → Submitter → PR Ch
 
 - Python 3.11+
 - [GitHub CLI](https://cli.github.com/) (`gh`) authenticated
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`) installed
+- At least one supported coding-agent CLI installed: `claude`, `codex`, or `opencode`
 - Optional: [CodeRabbitAI](https://coderabbit.ai/) GitHub App on target repo
 
 ## Setup
@@ -65,8 +65,8 @@ Each round:
    - `very_high` — destructive (alters workflows/outputs) → auto-skipped
    - If an assessment already exists, updates it rather than creating a duplicate
 3. **Q&A** (interactive only) — Discuss impacts with the Analyst; `skip` to move on
-4. **Develop** — Fix code (shares session with Analyst via `--continue`)
-5. **Review** — Local code review (git diff + tests); Developer fixes feedback
+4. **Develop** — Fix code in the target workspace
+5. **Review** — Independent local review; findings are explicitly handed back to Developer
 6. **Submit** — Branch, commit, push, open PR
 7. **PR Checks** — Wait for all checks with `gh pr checks --watch` → Developer reads CI and review feedback → fixes → local Reviewer validates → push → repeat until no action is needed
 
@@ -82,11 +82,13 @@ agents/
   reviewer.py             Local code review (diff + tests)
   submitter.py            Branch, commit, push, PR
   runners/
-    base.py               Abstract AgentRunner interface
-    claude.py             ClaudeRunner — claude -p backend
+    base.py               Backend contract, capabilities, and AgentResult
+    claude.py             Claude Code adapter with explicit session resume
+    codex.py              Codex CLI adapter with JSONL event parsing
+    opencode.py           OpenCode adapter with JSON event parsing
 ```
 
-All agents share a single Claude Code session via `--continue`, so context flows naturally — no redundant re-reading.
+Each role owns an independent backend session. Analyst, Developer, Reviewer, and Submitter can use different CLIs. The workspace, GitHub issue, PR feedback, and explicit review findings provide cross-role context without sharing an implicit latest session.
 
 ## Configuration
 
@@ -96,7 +98,14 @@ Copy `.env.example` to `.env` and edit. Full options:
 |----------|-------------|---------|
 | `PROJECT_DIR` | Target project path | — |
 | `GITHUB_REPO` | Target repo (owner/repo) | — |
+| `DEFAULT_BACKEND` | Default backend: `claude`, `codex`, or `opencode` | `claude` |
+| `ANALYST_BACKEND` | Analyst backend override | `DEFAULT_BACKEND` |
+| `DEVELOPER_BACKEND` | Developer backend override | `DEFAULT_BACKEND` |
+| `REVIEWER_BACKEND` | Reviewer backend override | `DEFAULT_BACKEND` |
+| `SUBMITTER_BACKEND` | Submitter backend override | `DEFAULT_BACKEND` |
 | `CLAUDE_FLAGS` | Claude Code flags | `--dangerously-skip-permissions` |
+| `CODEX_FLAGS` | Codex CLI flags | `--dangerously-bypass-approvals-and-sandbox` |
+| `OPENCODE_FLAGS` | OpenCode CLI flags | — |
 | `TIMEOUT_ANALYST` | Analyst timeout (s) | 3600 |
 | `TIMEOUT_DEVELOPER` | Developer timeout (s) | 10800 |
 | `TIMEOUT_REVIEWER` | Reviewer timeout (s) | 1800 |
@@ -109,17 +118,21 @@ Copy `.env.example` to `.env` and edit. Full options:
 
 Legacy variables `CODERABBIT_POLL_INTERVAL` and `CODERABBIT_MAX_WAIT` remain supported as fallbacks.
 
-## Custom Agent Backend
+## Backend Selection
 
-Implement `AgentRunner` to swap the LLM:
+Use one backend for every role:
 
-```python
-from agents.runners.base import AgentRunner
-
-class CustomRunner(AgentRunner):
-    def execute(self, prompt, timeout, cwd, continue_session):
-        ...
-
-# agents/base.py
-DEFAULT_RUNNER = CustomRunner()
+```env
+DEFAULT_BACKEND=codex
 ```
+
+Or mix backends while keeping sessions isolated:
+
+```env
+ANALYST_BACKEND=claude
+DEVELOPER_BACKEND=claude
+REVIEWER_BACKEND=codex
+SUBMITTER_BACKEND=claude
+```
+
+Only selected backends are required at startup. If `opencode` is configured but not available on `PATH`, Agent-Z fails fast with a clear error.

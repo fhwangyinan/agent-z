@@ -1,17 +1,18 @@
 from .base import Agent
-from config import TIMEOUT_SUBMITTER
+from config import SUBMITTER_BACKEND, TIMEOUT_SUBMITTER
 
 
 class SubmitterAgent(Agent):
     def __init__(self):
-        super().__init__("Submitter")
+        super().__init__("Submitter", SUBMITTER_BACKEND)
 
-    def submit(self, issue_number: int, continue_session: bool = False) -> str:
+    def submit(self, issue_number: int, resume_session: bool = False) -> str:
         prompt = (
-            f"为 Issue #{issue_number} 的修复创建新分支，commit，push，创建 PR（base: main），"
-            f"PR 描述中关联 #{issue_number}。提交描述和评论请使用英文。issue中也说明完成了哪些内容。最后输出 PR_URL=<链接>"
+            f"Create a branch for the fix to issue #{issue_number}, commit, push, and open a PR against "
+            f"main. Link issue #{issue_number} in the PR body and leave an English issue comment "
+            f"summarizing the completed work. End with PR_URL=<url>."
         )
-        output = self.run(prompt, timeout=TIMEOUT_SUBMITTER, continue_session=continue_session)
+        output = self.run(prompt, timeout=TIMEOUT_SUBMITTER, resume_session=resume_session)
         pr_url = self.extract(output, r"PR_URL=(\S+)")
         if pr_url is None:
             pr_url = self.extract(output, r"https://github\.com/[^\s]+/pull/\d+")
