@@ -60,12 +60,18 @@ def _get_bool(key: str, default: bool) -> bool:
     raise ValueError(f"{key} must be a boolean, got {raw!r}")
 
 
+def _get_csv(key: str, default: str) -> list[str]:
+    raw = os.environ.get(key, default)
+    return [part.strip() for part in raw.split(",") if part.strip()]
+
+
 # ---- Project ----
 PROJECT_DIR = _get("PROJECT_DIR", r"G:\Code\workspace_aieng")
 GITHUB_REPO = _get("GITHUB_REPO", "armpro24-blip/cad-cae-copilot")
 AGENT_Z_HOME = _get("AGENT_Z_HOME", os.path.join(_BASE, ".agent-z"))
 STATE_DB = _get("STATE_DB", os.path.join(AGENT_Z_HOME, "state.db"))
 WORKTREE_ROOT = _get("WORKTREE_ROOT", os.path.join(AGENT_Z_HOME, "worktrees"))
+SKIP_LABELS = _get_csv("SKIP_LABELS", "ongoing")
 
 # ---- Agent backends ----
 DEFAULT_BACKEND = _get("DEFAULT_BACKEND", "claude").lower()

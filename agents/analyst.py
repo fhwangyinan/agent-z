@@ -1,5 +1,5 @@
 from .base import Agent, PROJECT_DIR, GITHUB_REPO
-from config import ANALYST_BACKEND, TIMEOUT_ANALYST
+from config import ANALYST_BACKEND, SKIP_LABELS, TIMEOUT_ANALYST
 
 
 class AnalystAgent(Agent):
@@ -16,11 +16,13 @@ class AnalystAgent(Agent):
                 f"{PROJECT_DIR}. Assess a practical fix. End with RECOMMENDED_ISSUE={target_issue}."
             )
         else:
+            skip_labels = ", ".join(f"`{label}`" for label in SKIP_LABELS)
             prompt = (
                 f"Project: {PROJECT_DIR}. GitHub repository: {GITHUB_REPO}. List open issues and "
-                f"open PRs, exclude issues already covered by a complete PR, inspect relevant issue "
-                f"details and code, discard obsolete or meaningless issues, then recommend the "
-                f"highest-value actionable issue and assess a fix. End with RECOMMENDED_ISSUE=<number>."
+                f"open PRs, exclude issues with any of these labels: {skip_labels}. Exclude issues already "
+                f"covered by a complete PR, inspect relevant issue details and code, discard obsolete "
+                f"or meaningless issues, then recommend the highest-value actionable issue and assess "
+                f"a fix. End with RECOMMENDED_ISSUE=<number>."
             )
         output = self.run(prompt, timeout=TIMEOUT_ANALYST, resume_session=resume_session)
         issue_number = self.extract_number(output, r"RECOMMENDED_ISSUE=(\d+)")

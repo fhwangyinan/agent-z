@@ -108,6 +108,72 @@ class LocalReviewTests(QuietRunTest):
         )
 
 
+class SkipLabelTests(QuietRunTest):
+    @patch("run.run_cmd")
+    def test_mark_issue_with_skip_label_adds_first_label_and_event(self, run_cmd):
+        run_cmd.side_effect = [
+            result(stdout='{"labels": []}'),
+            result(),
+            result(),
+        ]
+        record = SimpleNamespace(
+            run_id="run-1",
+            issue_number=123,
+            stage="assessed",
+            status="running",
+        )
+        store = Mock()
+        store.list_events.return_value = []
+        store.get.return_value = record
+        returned = run.mark_issue_with_skip_label(record, store)
+        self.assertIs(returned, record)
+        self.assertEqual(run_cmd.call_args_list[2].args[0][:3], ["gh", "issue", "edit"])
+        self.assertIn("ongoing", run_cmd.call_args_list[2].args[0])
+        store.add_event.assert_called_once()
+        self.assertEqual(store.add_event.call_args.args[1], "issue_labeled_skip")
+
+    @patch("run.run_cmd")
+    def test_mark_issue_with_skip_label_rejects_any_existing_skip_label(self, run_cmd):
+        run_cmd.return_value = result(stdout='{"labels": [{"name": "blocked"}]}')
+        record = SimpleNamespace(
+            run_id="run-1",
+            issue_number=123,
+            stage="assessed",
+            status="running",
+        )
+        store = Mock()
+        store.list_events.return_value = []
+        with patch("run.SKIP_LABELS", ["ongoing", "blocked"]):
+            with self.assertRaisesRegex(RuntimeError, "already has skip label"):
+                run.mark_issue_with_skip_label(record, store)
+        store.add_event.assert_not_called()
+        self.assertEqual(run_cmd.call_count, 1)
+
+    @patch("run.run_cmd", return_value=result(returncode=1, stderr="boom"))
+    def test_mark_issue_with_skip_label_stops_when_labels_cannot_be_read(self, run_cmd):
+        record = SimpleNamespace(
+            run_id="run-1",
+            issue_number=123,
+            stage="assessed",
+            status="running",
+        )
+        store = Mock()
+        store.list_events.return_value = []
+        with self.assertRaisesRegex(RuntimeError, "could not read labels"):
+            run.mark_issue_with_skip_label(record, store)
+        self.assertEqual(run_cmd.call_count, 1)
+
+    @patch("run.run_cmd")
+    def test_mark_issue_with_skip_label_is_idempotent_for_same_run(self, run_cmd):
+        record = SimpleNamespace(run_id="run-1", issue_number=123)
+        store = Mock()
+        store.list_events.return_value = [
+            SimpleNamespace(event_type="issue_labeled_skip")
+        ]
+        self.assertIs(run.mark_issue_with_skip_label(record, store), record)
+        run_cmd.assert_not_called()
+
+
 class RoundFlowTests(QuietRunTest):
     @patch("run.execute_task", return_value=False)
     @patch("run._session_snapshot", return_value={"analyst": "session-1"})

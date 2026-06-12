@@ -74,7 +74,7 @@ python run.py --worker              # 持续领取队列任务
 
 每轮执行：
 
-1. **挑选 Issue** — Agent 推荐最优 open issue（排除已有完整 PR 的）
+1. **挑选 Issue** — Agent 推荐最优 open issue（排除带有 `SKIP_LABELS` 或已有完整 PR 的）
 2. **影响评估** — 分析潜在影响，评定风险等级，英文报告写入 issue：
    - `very_low` — 无影响
    - `low` — 轻微影响
@@ -83,11 +83,12 @@ python run.py --worker              # 持续领取队列任务
    - `very_high` — 破坏性变更（改变流程/输出）→ 自动跳过
    - 已有评估则追加更新，不重复创建
 3. **交互问答**（仅交互模式）— 就影响评估与 Analyst 对话；`skip` 换 issue
-4. **任务隔离** — 为每个任务创建独立分支和 Git worktree
-5. **开发修复** — 在独立 worktree 中修复代码
-6. **本地审查** — 独立 Reviewer 审查；发现的问题显式交给 Developer 修复
-7. **提交 PR** — commit、push、创建 PR
-8. **PR Checks** — 使用 `gh pr checks --watch` 等待全部 checks → Developer 读取 CI 与 review 反馈 → 修复 → 本地 Reviewer 复查通过 → push → 循环直到无需修改
+4. **标记已认领** — 开发开始前给 Issue 添加 `SKIP_LABELS` 中的第一个标签
+5. **任务隔离** — 为每个任务创建独立分支和 Git worktree
+6. **开发修复** — 在独立 worktree 中修复代码
+7. **本地审查** — 独立 Reviewer 审查；发现的问题显式交给 Developer 修复
+8. **提交 PR** — commit、push、创建 PR
+9. **PR Checks** — 使用 `gh pr checks --watch` 等待全部 checks → Developer 读取 CI 与 review 反馈 → 修复 → 本地 Reviewer 复查通过 → push → 循环直到无需修改
 
 ## 架构
 
@@ -114,7 +115,7 @@ agents/
 
 每个持久化任务拥有唯一 Run ID 和流程阶段。多个 Agent-Z 进程可在 `MAX_PARALLEL_TASKS` 限制内安全并行；SQLite 提供 Issue 锁，改动文件登记会在提交前阻止活跃任务之间的文件冲突。失败、中断和 `needs_human` 任务会保留 worktree，便于检查与恢复。
 
-结构化事件会写入 SQLite，覆盖队列、worker、阶段、状态、恢复、取消和文件声明等变化。远程或无人值守任务需要诊断时，可用 `python run.py --inspect RUN_ID` 查看时间线。
+结构化事件会写入 SQLite，覆盖队列、worker、阶段、状态、恢复、取消、跳过标签和文件声明等变化。远程或无人值守任务需要诊断时，可用 `python run.py --inspect RUN_ID` 查看时间线。
 
 ## 配置
 
@@ -124,6 +125,7 @@ agents/
 |------|------|--------|
 | `PROJECT_DIR` | 目标项目路径 | — |
 | `GITHUB_REPO` | 目标仓库 (owner/repo) | — |
+| `SKIP_LABELS` | 逗号分隔的跳过标签；开发前会添加第一个标签 | `ongoing` |
 | `AGENT_Z_HOME` | 运行状态目录 | `.agent-z` |
 | `STATE_DB` | SQLite 状态数据库 | `.agent-z/state.db` |
 | `WORKTREE_ROOT` | 独立 worktree 目录 | `.agent-z/worktrees` |

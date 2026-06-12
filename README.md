@@ -74,7 +74,7 @@ python run.py --worker              # continuously claim queued tasks
 
 Each round:
 
-1. **Pick Issue** — Agent recommends the best open issue (filtering out issues with existing complete PRs)
+1. **Pick Issue** — Agent recommends the best open issue (filtering out issues with `SKIP_LABELS` or existing complete PRs)
 2. **Impact Assessment** — Analyzes potential impact, assigns a risk level, writes English report to the issue:
    - `very_low` — no impact
    - `low` — minor impact
@@ -83,11 +83,12 @@ Each round:
    - `very_high` — destructive (alters workflows/outputs) → auto-skipped
    - If an assessment already exists, updates it rather than creating a duplicate
 3. **Q&A** (interactive only) — Discuss impacts with the Analyst; `skip` to move on
-4. **Isolate** — Create a dedicated branch and Git worktree for the run
-5. **Develop** — Fix code in the isolated worktree
-6. **Review** — Independent local review; findings are explicitly handed back to Developer
-7. **Submit** — Commit, push, open PR
-8. **PR Checks** — Wait for all checks with `gh pr checks --watch` → Developer reads CI and review feedback → fixes → local Reviewer validates → push → repeat until no action is needed
+4. **Mark Claimed** — Add the first `SKIP_LABELS` label before development starts
+5. **Isolate** — Create a dedicated branch and Git worktree for the run
+6. **Develop** — Fix code in the isolated worktree
+7. **Review** — Independent local review; findings are explicitly handed back to Developer
+8. **Submit** — Commit, push, open PR
+9. **PR Checks** — Wait for all checks with `gh pr checks --watch` → Developer reads CI and review feedback → fixes → local Reviewer validates → push → repeat until no action is needed
 
 ## Architecture
 
@@ -114,7 +115,7 @@ Each role owns an independent backend session. Analyst, Developer, Reviewer, and
 
 Every persisted run has a unique ID and workflow stage. Separate Agent-Z processes can safely execute tasks in parallel up to `MAX_PARALLEL_TASKS`; SQLite enforces Issue locks, and changed-file claims stop overlapping active tasks before submission. Failed, interrupted, and `needs_human` runs keep their worktrees for inspection and resume.
 
-Structured run events are stored in SQLite for queue, worker, stage, status, resume, cancel, and file-claim transitions. Use `python run.py --inspect RUN_ID` to review the timeline when a remote or unattended run needs diagnosis.
+Structured run events are stored in SQLite for queue, worker, stage, status, resume, cancel, skip-label, and file-claim transitions. Use `python run.py --inspect RUN_ID` to review the timeline when a remote or unattended run needs diagnosis.
 
 ## Configuration
 
@@ -124,6 +125,7 @@ Copy `.env.example` to `.env` and edit. Full options:
 |----------|-------------|---------|
 | `PROJECT_DIR` | Target project path | — |
 | `GITHUB_REPO` | Target repo (owner/repo) | — |
+| `SKIP_LABELS` | Comma-separated labels to skip; the first label is added before development | `ongoing` |
 | `AGENT_Z_HOME` | Runtime state directory | `.agent-z` |
 | `STATE_DB` | SQLite state database | `.agent-z/state.db` |
 | `WORKTREE_ROOT` | Isolated worktree directory | `.agent-z/worktrees` |

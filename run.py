@@ -48,6 +48,7 @@ from config import (
     MAX_RUN_SECONDS,
     CLEANUP_COMPLETED_WORKTREES,
     WORKER_IDLE_SLEEP,
+    SKIP_LABELS,
 )
 
 
@@ -73,6 +74,8 @@ def validate_environment():
         raise RuntimeError(f"PROJECT_DIR does not exist: {PROJECT_DIR}")
     if not GITHUB_REPO or "/" not in GITHUB_REPO:
         raise RuntimeError(f"GITHUB_REPO must use owner/repo format, got {GITHUB_REPO!r}")
+    if not SKIP_LABELS:
+        raise RuntimeError("SKIP_LABELS must include at least one label")
     selected_backends = {
         ANALYST_BACKEND,
         DEVELOPER_BACKEND,
@@ -178,6 +181,100 @@ def _get_issue_title(issue_number: int) -> str:
     except Exception:
         pass
     return "(unable to fetch title)"
+
+
+def _get_issue_labels(issue_number: int) -> list[str] | None:
+    result = run_cmd(
+        [
+            "gh", "issue", "view", str(issue_number),
+            "--repo", GITHUB_REPO,
+            "--json", "labels",
+        ],
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return [label.get("name", "") for label in data.get("labels", [])]
+
+
+def _ensure_label_exists(label: str):
+    result = run_cmd(
+        [
+            "gh", "label", "create", label,
+            "--repo", GITHUB_REPO,
+            "--color", "FBCA04",
+            "--description", "Agent-Z is actively working on this issue",
+        ],
+        check=False,
+    )
+    if result.returncode == 0:
+        return
+    message = f"{result.stdout}\n{result.stderr}".lower()
+    if "already exists" in message:
+        return
+    warn(f"Could not create label {label!r}; attempting to use it anyway")
+
+
+def mark_issue_with_skip_label(record: RunRecord, store: RunStore) -> RunRecord:
+    if any(
+        event.event_type == "issue_labeled_skip"
+        for event in store.list_events(record.run_id)
+    ):
+        return record
+
+    labels = _get_issue_labels(record.issue_number)
+    if labels is None:
+        raise RuntimeError(
+            f"could not read labels for issue #{record.issue_number}; "
+            "refusing to start development"
+        )
+    normalized = {label.lower() for label in labels or []}
+    conflicting = [
+        label for label in SKIP_LABELS
+        if label.lower() in normalized
+    ]
+    if conflicting:
+        raise RuntimeError(
+            f"issue #{record.issue_number} already has skip label(s): "
+            f"{', '.join(conflicting)}; "
+            "skipping to avoid duplicate active work"
+        )
+
+    claim_label = SKIP_LABELS[0]
+    _ensure_label_exists(claim_label)
+    result = run_cmd(
+        [
+            "gh", "issue", "edit", str(record.issue_number),
+            "--repo", GITHUB_REPO,
+            "--add-label", claim_label,
+        ],
+        check=False,
+    )
+    if result.returncode != 0:
+        details = (result.stderr or result.stdout).strip()
+        raise RuntimeError(
+            f"could not add label {claim_label!r} to issue "
+            f"#{record.issue_number}: {details}"
+        )
+
+    store.add_event(
+        record.run_id,
+        "issue_labeled_skip",
+        stage=record.stage,
+        status=record.status,
+        message=f"Added label {claim_label!r} to issue #{record.issue_number}",
+        data={
+            "label": claim_label,
+            "skip_labels": SKIP_LABELS,
+            "issue_number": record.issue_number,
+        },
+    )
+    done(f"Marked issue #{record.issue_number} with {claim_label!r}")
+    return store.get(record.run_id)
 
 
 def choose_issue() -> int | None:
@@ -418,6 +515,7 @@ def execute_task(
 
         _check_run_budget(started)
         if not record.worktree_path:
+            record = mark_issue_with_skip_label(record, store)
             prepare_base_repo()
             branch = record.branch or f"agent-z/{record.issue_number}-{record.run_id}"
             workspace = worktrees.create(record.run_id, branch)
