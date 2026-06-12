@@ -4,10 +4,13 @@
 
 Lightweight, backend-agnostic coding-agent automation for autonomous development loops.
 
-Agent-Z orchestrates specialized agents powered by Claude Code, Codex, or OpenCode, forming a fully autonomous cycle: pick issue → assess impact → fix code → review locally → open PR → wait for and iterate on PR checks.
+Agent-Z combines a deterministic control plane with a flexible Task Lead, an independent Reviewer, scalable Workers, and a Reconciler, powered by Claude Code, Codex, or OpenCode.
 
 ```
-Analyst → Impact Assessment → Developer → Reviewer → Submitter → PR Checks → Developer → ...
+Open Issues/PRs ← on-demand exploration ← Task Lead (select + plan + develop)
+                                         ↓
+Durable Queue → Worker Pool → Independent Reviewer → Deterministic Coordinator
+                     ↘              Reconciler              ↗
 ```
 
 ## Prerequisites
@@ -35,15 +38,40 @@ python run.py --loop 5              # autonomous: 5 rounds, skip high-risk issue
 python run.py --loop 5 --force      # autonomous: develop all issues regardless of risk
 python run.py --issue 123           # run one unattended issue in an isolated worktree
 python run.py --enqueue 123         # add an issue to the persistent queue
-python run.py --run-next            # claim and run the oldest queued issue
+python run.py --plan-next           # plan the oldest queued issue once
+python run.py --run-next            # claim and run the oldest ready issue
 python run.py --resume RUN_ID       # resume from the persisted workflow stage
 python run.py --list-runs           # inspect recent and active runs
 python run.py --inspect RUN_ID      # show run metadata and structured events
 python run.py --cancel RUN_ID       # release locks and remove an abandoned worktree
-python run.py --worker              # continuously claim queued tasks
+python run.py --worker              # continuously claim planned, ready tasks
+python run.py --planner             # continuously turn queued issues into execution plans
+python run.py --reconciler          # continuously recover expired leases
+python run.py --reconcile-once      # recover expired leases once
 ```
 
 `--cancel` refuses to remove a task that is still owned by a live Agent-Z process. Use it for queued, stopped, or abandoned runs.
+
+Run each pool in separate processes and scale them independently:
+
+```bash
+python run.py --planner
+python run.py --worker
+python run.py --worker
+python run.py --reconciler
+```
+
+### TUI Observability
+
+The terminal output is designed to remain useful both interactively and in unattended logs:
+
+- Every major stage displays the full Run ID, Issue number, status, stage, lease role, and cumulative elapsed time.
+- Agent calls report backend/session mode and execution time.
+- Worker, Planner, and Reconciler processes display startup configuration, idle heartbeats, claimed counts, uptime, and next scan time.
+- PR checks render as a result table with total wait time.
+- Completed, skipped, failed, interrupted, and `needs_human` runs render consistent terminal summaries.
+- `--list-runs` shows a color-coded status overview, run age, leases, PRs, and errors.
+- `--inspect RUN_ID` shows runtime details, the persisted plan, and an event timeline with relative timestamps.
 
 ### Interactive Mode
 
@@ -63,10 +91,14 @@ python run.py --worker              # continuously claim queued tasks
 | `--force` | Ignore risk levels, develop all issues |
 | `--issue N` | Run one issue immediately |
 | `--enqueue N` | Add an issue to the SQLite queue |
-| `--run-next` | Claim the oldest queued task when a slot is available |
+| `--plan-next` | Plan the oldest queued issue once |
+| `--run-next` | Claim the oldest planned, ready task when a slot is available |
 | `--resume RUN_ID` | Resume a failed or interrupted task |
 | `--inspect RUN_ID` | Show persisted metadata and structured event history |
-| `--worker` | Run a lightweight queue worker until interrupted |
+| `--planner` | Run one independently scalable Planner process |
+| `--worker` | Run one independently scalable development Worker |
+| `--reconciler` | Recover expired Planner/Worker leases continuously |
+| `--reconcile-once` | Recover expired leases once |
 | `--worker-max-runs N` | Stop worker after N claimed runs (`0` = forever) |
 | `--keep-worktree` | Keep a completed task's worktree |
 
@@ -74,8 +106,8 @@ python run.py --worker              # continuously claim queued tasks
 
 Each round:
 
-1. **Pick Issue** — Agent recommends the best open issue (filtering out issues with `SKIP_LABELS` or existing complete PRs)
-2. **Impact Assessment** — Analyzes potential impact, assigns a risk level, writes English report to the issue:
+1. **Queue Issue** — Persist an issue in the planning queue.
+2. **Task Lead Planning** — Explore relevant open issues/PRs on demand, analyze the issue, assess impact, publish a human-readable issue comment, and persist a versioned structured execution plan.
    - `very_low` — no impact
    - `low` — minor impact
    - `medium` — moderate impact
@@ -83,27 +115,34 @@ Each round:
    - `very_high` — destructive (alters workflows/outputs) → auto-skipped
    - If an assessment already exists, updates it rather than creating a duplicate
 3. **Q&A** (interactive only) — Discuss impacts with the Analyst; `skip` to move on
-4. **Mark Claimed** — Add the first `SKIP_LABELS` label before development starts
-5. **Isolate** — Create a dedicated branch and Git worktree for the run
-6. **Develop** — Fix code in the isolated worktree
-7. **Review** — Independent local review; findings are explicitly handed back to Developer
-8. **Submit** — Commit, push, open PR
-9. **PR Checks** — Wait for all checks with `gh pr checks --watch` → Developer reads CI and review feedback → fixes → local Reviewer validates → push → repeat until no action is needed
+4. **Worker Preflight** — Re-check issue state, labels, related PRs, plan freshness, and predicted file conflicts.
+5. **Mark Claimed** — Add the first `SKIP_LABELS` label before development starts
+6. **Isolate** — Create a dedicated branch and Git worktree for the run
+7. **Develop** — Continue in the same Task Lead session and fix code in the isolated worktree
+8. **Review** — Independent local review; findings are explicitly handed back to Developer
+9. **Submit** — The Coordinator deterministically commits, pushes, opens, and verifies the PR
+10. **PR Checks** — Wait for all checks with `gh pr checks --watch` → Developer reads CI and review feedback → fixes → local Reviewer validates → push → repeat until no action is needed
 
 ## Architecture
 
 ```
-run.py                    Orchestrator — loop control and session management
+run.py                    Thin CLI entry point and compatibility exports
 config.py                 Configuration loaded from .env
 orchestration/
   store.py                SQLite queue, workflow state, issue and file locks
   worktree.py             Isolated worktree lifecycle
+  runtime.py              Mutable CLI/runtime options
+  errors.py               Shared workflow exceptions
+  tui.py                  Rich terminal rendering and run inspection
+  github_ops.py           Git/GitHub queries, labels, preflight, and cleanup
+  submission.py           Commit metadata, push, PR creation, and PR adoption
+  workflow.py             Planning and task execution state machine
+  pools.py                Planner, Worker, and Reconciler process loops
 agents/
   base.py                 Agent base class with pluggable runner
-  analyst.py              Issue analysis, impact assessment, Q&A
-  developer.py            Code fixes, review handling
+  analyst.py              Task Lead issue selection, planning, impact assessment, Q&A
+  developer.py            Task Lead code fixes and review handling
   reviewer.py             Local code review (diff + tests)
-  submitter.py            Branch, commit, push, PR
   runners/
     base.py               Backend contract, capabilities, and AgentResult
     claude.py             Claude Code adapter with explicit session resume
@@ -111,9 +150,17 @@ agents/
     opencode.py           OpenCode adapter with JSON event parsing
 ```
 
-Each role owns an independent backend session. Analyst, Developer, Reviewer, and Submitter can use different CLIs. The workspace, GitHub issue, PR feedback, and explicit review findings provide cross-role context without sharing an implicit latest session.
+Planning and development share one persisted `task_lead` backend session. The Reviewer keeps an independent session, while the Coordinator performs deterministic lifecycle and GitHub operations.
 
-Every persisted run has a unique ID and workflow stage. Separate Agent-Z processes can safely execute tasks in parallel up to `MAX_PARALLEL_TASKS`; SQLite enforces Issue locks, and changed-file claims stop overlapping active tasks before submission. Failed, interrupted, and `needs_human` runs keep their worktrees for inspection and resume.
+Every persisted run has a unique ID, structured execution plan, workflow stage, and role lease. Any number of Planner and Worker processes can compete safely for their respective queues. SQLite performs atomic claims and Issue locks; predicted and actual changed-file claims stop overlapping active tasks. Reconciler processes requeue abandoned planning leases and quarantine abandoned development for human inspection.
+
+Before development, Agent-Z verifies that the required active-work label was actually applied. During submission, the Task Lead generates the commit message, PR title, and PR body from the final diff; the Coordinator validates that metadata, deterministically commits pending changes, pushes the run branch, calls `gh pr create`, and verifies the result through GitHub. Invalid Agent metadata falls back to safe templates. A pre-existing branch PR is explicitly recorded as externally adopted.
+
+Completed and cancelled runs remove their owned active-work label and clean their worktree. Failed and `needs_human` runs keep the branch, label, and worktree by default for recovery; leases are still released. Set `CLEANUP_FAILED_WORKTREES=true` to remove failed worktrees while preserving the branch and active-work label.
+
+Routine discovery queries are open-only: issue selection lists open issues and open PRs, Worker preflight checks related open PRs, and submission recovery adopts only open PRs from the task branch. Closed and merged history is queried only by explicit item URL when a known PR must be inspected.
+
+The Task Lead explores open issues and open PRs only when needed using targeted, paginated queries. The Coordinator does not inject a backlog snapshot into prompts, preserving flexible exploration without repeatedly loading repository-wide state.
 
 Structured run events are stored in SQLite for queue, worker, stage, status, resume, cancel, skip-label, and file-claim transitions. Use `python run.py --inspect RUN_ID` to review the timeline when a remote or unattended run needs diagnosis.
 
@@ -130,17 +177,14 @@ Copy `.env.example` to `.env` and edit. Full options:
 | `STATE_DB` | SQLite state database | `.agent-z/state.db` |
 | `WORKTREE_ROOT` | Isolated worktree directory | `.agent-z/worktrees` |
 | `DEFAULT_BACKEND` | Default backend: `claude`, `codex`, or `opencode` | `claude` |
-| `ANALYST_BACKEND` | Analyst backend override | `DEFAULT_BACKEND` |
-| `DEVELOPER_BACKEND` | Developer backend override | `DEFAULT_BACKEND` |
+| `TASK_LEAD_BACKEND` | Shared issue selection, planning, and development backend | `ANALYST_BACKEND` or `DEFAULT_BACKEND` |
 | `REVIEWER_BACKEND` | Reviewer backend override | `DEFAULT_BACKEND` |
-| `SUBMITTER_BACKEND` | Submitter backend override | `DEFAULT_BACKEND` |
 | `CLAUDE_FLAGS` | Claude Code flags | `--dangerously-skip-permissions` |
 | `CODEX_FLAGS` | Codex CLI flags | `--dangerously-bypass-approvals-and-sandbox` |
 | `OPENCODE_FLAGS` | OpenCode CLI flags | — |
 | `TIMEOUT_ANALYST` | Analyst timeout (s) | 3600 |
 | `TIMEOUT_DEVELOPER` | Developer timeout (s) | 10800 |
 | `TIMEOUT_REVIEWER` | Reviewer timeout (s) | 1800 |
-| `TIMEOUT_SUBMITTER` | Submitter timeout (s) | 600 |
 | `RETRY_TIMEOUT` | Retry timeout (s) | 3600 |
 | `PR_CHECKS_INTERVAL` | PR checks watch interval (s) | 10 |
 | `PR_CHECKS_MAX_WAIT` | Max wait for PR checks (s) | 900 |
@@ -149,7 +193,12 @@ Copy `.env.example` to `.env` and edit. Full options:
 | `MAX_PARALLEL_TASKS` | Maximum active tasks across processes | 2 |
 | `MAX_RUN_SECONDS` | Per-attempt runtime budget | 21600 |
 | `CLEANUP_COMPLETED_WORKTREES` | Remove worktrees after successful completion | `true` |
+| `CLEANUP_FAILED_WORKTREES` | Remove failed/needs-human worktrees while preserving branch and label | `false` |
 | `WORKER_IDLE_SLEEP` | Queue worker sleep when no task is available | 30 |
+| `PLANNER_IDLE_SLEEP` | Planner sleep when no issue awaits analysis | 30 |
+| `RECONCILER_INTERVAL` | Seconds between expired-lease scans | 60 |
+| `PLANNER_LEASE_SECONDS` | Planner claim lifetime | 7200 |
+| `WORKER_LEASE_SECONDS` | Worker claim lifetime | 21600 |
 
 Legacy variables `CODERABBIT_POLL_INTERVAL` and `CODERABBIT_MAX_WAIT` remain supported as fallbacks.
 
@@ -161,13 +210,11 @@ Use one backend for every role:
 DEFAULT_BACKEND=codex
 ```
 
-Or mix backends while keeping sessions isolated:
+Or keep Task Lead context across planning and development while using an independent Reviewer:
 
 ```env
-ANALYST_BACKEND=claude
-DEVELOPER_BACKEND=claude
+TASK_LEAD_BACKEND=claude
 REVIEWER_BACKEND=codex
-SUBMITTER_BACKEND=claude
 ```
 
 Only selected backends are required at startup. If `opencode` is configured but not available on `PATH`, Agent-Z fails fast with a clear error.

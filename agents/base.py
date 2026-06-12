@@ -1,6 +1,7 @@
 import re
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from datetime import datetime
 
@@ -35,14 +36,12 @@ AGENT_ICONS = {
     "Analyst":   "A",
     "Developer": "D",
     "Reviewer":  "R",
-    "Submitter": "S",
 }
 
 AGENT_COLORS = {
     "Analyst":   "cyan",
     "Developer": "green",
     "Reviewer":  "magenta",
-    "Submitter": "yellow",
 }
 
 
@@ -66,6 +65,17 @@ def warn(msg: str):
 
 def error(msg: str):
     console.print(f"  [red]x[/red] {escape(msg)}")
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {seconds:02d}s"
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
 
 
 def _short_output(text: str | None, limit: int = 1000) -> str:
@@ -119,6 +129,7 @@ class Agent:
     def run(self, prompt: str, timeout: int = 600, resume_session: bool = False) -> str:
         session_id = self.session_id if resume_session else None
         mode = f"{self.runner.name}:{'resume' if session_id else 'new'}"
+        started = time.monotonic()
         with agent_status(self.name, mode):
             result = self.runner.execute(
                 prompt=prompt,
@@ -127,7 +138,10 @@ class Agent:
                 session_id=session_id,
             )
         self.session_id = result.session_id
-        done(f"[{self.color}]{self.name}[/{self.color}] done")
+        done(
+            f"[{self.color}]{self.name}[/{self.color}] done "
+            f"[dim]in {format_duration(time.monotonic() - started)} | {mode}[/dim]"
+        )
         return result.output
 
     def extract(self, text: str, pattern: str, default=None):

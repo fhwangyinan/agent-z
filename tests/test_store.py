@@ -64,11 +64,76 @@ class RunStoreTests(unittest.TestCase):
     def test_queue_claims_oldest_task_when_slot_available(self):
         first = self.store.enqueue("owner/repo", 1)
         self.store.enqueue("owner/repo", 2)
-        claimed = self.store.claim_next(max_parallel=1)
+        planning = self.store.claim_for_planning(lease_seconds=60)
+        self.assertEqual(planning.run_id, first.run_id)
+        self.store.finish_planning(
+            planning.run_id,
+            plan={"summary": "fix it"},
+            risk="low",
+        )
+        claimed = self.store.claim_ready(max_parallel=1, lease_seconds=60)
         self.assertEqual(claimed.run_id, first.run_id)
         self.assertEqual(claimed.status, "running")
-        self.assertEqual(self.store.list_events(first.run_id)[-1].event_type, "run_claimed")
-        self.assertIsNone(self.store.claim_next(max_parallel=1))
+        self.assertEqual(self.store.list_events(first.run_id)[-1].event_type, "worker_claimed")
+        self.assertIsNone(self.store.claim_ready(max_parallel=1, lease_seconds=60))
+
+    def test_worker_cannot_claim_unplanned_issue(self):
+        self.store.enqueue("owner/repo", 1)
+        self.assertIsNone(self.store.claim_ready(max_parallel=1, lease_seconds=60))
+
+    def test_worker_preserves_recovered_resume_stage(self):
+        queued = self.store.enqueue("owner/repo", 1)
+        self.store.update(
+            queued.run_id,
+            status="ready",
+            stage="waiting_checks",
+            pr_url="https://example/pr/1",
+        )
+        claimed = self.store.claim_ready(max_parallel=1, lease_seconds=60)
+        self.assertEqual(claimed.stage, "waiting_checks")
+
+    def test_planning_persists_structured_plan(self):
+        queued = self.store.enqueue("owner/repo", 1)
+        planning = self.store.claim_for_planning(60, queued.run_id)
+        ready = self.store.finish_planning(
+            planning.run_id,
+            plan={"summary": "fix it", "predicted_files": ["src/a.py"]},
+            risk="medium",
+        )
+        self.assertEqual(ready.status, "ready")
+        self.assertEqual(ready.plan["predicted_files"], ["src/a.py"])
+        self.assertIsNone(ready.owner_pid)
+
+    @patch("orchestration.store._pid_alive", return_value=False)
+    def test_reconciler_requeues_expired_planner_lease(self, pid_alive):
+        queued = self.store.enqueue("owner/repo", 1)
+        planning = self.store.claim_for_planning(60, queued.run_id)
+        self.store.update(planning.run_id, lease_expires_at="2000-01-01T00:00:00+00:00")
+        reconciled = self.store.reconcile_expired()
+        self.assertEqual(reconciled[0].status, "queued")
+        self.assertEqual(reconciled[0].stage, "queued")
+
+    def test_reconciler_quarantines_expired_worker_lease(self):
+        queued = self.store.enqueue("owner/repo", 1)
+        self.store.claim_for_planning(60, queued.run_id)
+        self.store.finish_planning(queued.run_id, plan={}, risk="low")
+        running = self.store.claim_ready(max_parallel=1, lease_seconds=60)
+        self.store.update(running.run_id, lease_expires_at="2000-01-01T00:00:00+00:00")
+        reconciled = self.store.reconcile_expired()
+        self.assertEqual(reconciled[0].status, "needs_human")
+        self.assertEqual(reconciled[0].stage, "ready")
+
+    def test_lists_stranded_submissions_for_recovery(self):
+        run = self.store.create("owner/repo", 1, max_parallel=1)
+        self.store.update(
+            run.run_id,
+            status="failed",
+            stage="submitting",
+            worktree_path="worktree",
+            branch="agent-z/1-run",
+        )
+        candidates = self.store.list_submission_recovery_candidates()
+        self.assertEqual([candidate.run_id for candidate in candidates], [run.run_id])
 
     def test_queued_issue_is_locked(self):
         self.store.enqueue("owner/repo", 1)
@@ -84,7 +149,9 @@ class RunStoreTests(unittest.TestCase):
 
     def test_resume_allows_current_process_to_continue_claimed_task(self):
         record = self.store.enqueue("owner/repo", 1)
-        self.store.claim_next(max_parallel=1)
+        self.store.claim_for_planning(60, record.run_id)
+        self.store.finish_planning(record.run_id, plan={}, risk="low")
+        self.store.claim_ready(max_parallel=1, lease_seconds=60)
         resumed = self.store.resume(record.run_id, max_parallel=1)
         self.assertEqual(resumed.owner_pid, getpid())
 

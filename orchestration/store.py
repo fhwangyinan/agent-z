@@ -6,16 +6,20 @@ import sqlite3
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
-ACTIVE_STATUSES = {"running", "waiting_checks"}
+ACTIVE_STATUSES = {"planning", "running", "waiting_checks"}
 FINAL_STATUSES = {"completed", "failed", "skipped", "needs_human", "cancelled"}
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _lease_deadline(seconds: int) -> str:
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
 
 
 def _pid_alive(pid: int) -> bool:
@@ -45,6 +49,9 @@ class RunRecord:
     branch: str | None
     pr_url: str | None
     risk: str | None
+    plan: dict
+    lease_role: str | None
+    lease_expires_at: str | None
     sessions: dict[str, str]
     touched_files: list[str]
     owner_pid: int | None
@@ -96,6 +103,9 @@ class RunStore:
                     branch TEXT,
                     pr_url TEXT,
                     risk TEXT,
+                    plan TEXT NOT NULL DEFAULT '{}',
+                    lease_role TEXT,
+                    lease_expires_at TEXT,
                     sessions TEXT NOT NULL DEFAULT '{}',
                     touched_files TEXT NOT NULL DEFAULT '[]',
                     owner_pid INTEGER,
@@ -130,7 +140,7 @@ class RunStore:
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS active_issue_lock
                 ON runs(repo, issue_number)
-                WHERE status IN ('queued', 'running', 'waiting_checks')
+                WHERE status IN ('queued', 'planning', 'ready', 'running', 'waiting_checks')
                 """
             )
             columns = {
@@ -143,12 +153,21 @@ class RunStore:
                 )
             if "owner_pid" not in columns:
                 connection.execute("ALTER TABLE runs ADD COLUMN owner_pid INTEGER")
+            if "plan" not in columns:
+                connection.execute(
+                    "ALTER TABLE runs ADD COLUMN plan TEXT NOT NULL DEFAULT '{}'"
+                )
+            if "lease_role" not in columns:
+                connection.execute("ALTER TABLE runs ADD COLUMN lease_role TEXT")
+            if "lease_expires_at" not in columns:
+                connection.execute("ALTER TABLE runs ADD COLUMN lease_expires_at TEXT")
 
     @staticmethod
     def _record(row: sqlite3.Row) -> RunRecord:
         data = dict(row)
         data["sessions"] = json.loads(data["sessions"] or "{}")
         data["touched_files"] = json.loads(data["touched_files"] or "[]")
+        data["plan"] = json.loads(data["plan"] or "{}")
         return RunRecord(**data)
 
     @staticmethod
@@ -244,10 +263,13 @@ class RunStore:
                     """
                     INSERT INTO runs (
                         run_id, repo, issue_number, status, stage, sessions, owner_pid,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, 'running', 'created', '{}', ?, ?, ?)
+                        lease_role, lease_expires_at, created_at, updated_at
+                    ) VALUES (?, ?, ?, 'running', 'created', '{}', ?, 'worker', ?, ?, ?)
                     """,
-                    (run_id, repo, issue_number, os.getpid(), timestamp, timestamp),
+                    (
+                        run_id, repo, issue_number, os.getpid(),
+                        _lease_deadline(21600), timestamp, timestamp,
+                    ),
                 )
                 self._insert_event(
                     connection,
@@ -293,39 +315,165 @@ class RunStore:
             ) from exc
         return self.get(run_id)
 
-    def claim_next(self, max_parallel: int) -> RunRecord | None:
+    def _claim(
+        self,
+        *,
+        from_status: str,
+        to_status: str,
+        stage: str | None,
+        role: str,
+        lease_seconds: int,
+        max_parallel: int | None = None,
+        run_id: str | None = None,
+    ) -> RunRecord | None:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            active = connection.execute(
-                "SELECT COUNT(*) FROM runs WHERE status IN ('running', 'waiting_checks')"
-            ).fetchone()[0]
-            if active >= max_parallel:
-                return None
-            row = connection.execute(
-                """
-                SELECT run_id FROM runs
-                WHERE status = 'queued'
-                ORDER BY created_at
-                LIMIT 1
-                """
-            ).fetchone()
+            if max_parallel is not None:
+                active = connection.execute(
+                    "SELECT COUNT(*) FROM runs WHERE status IN ('running', 'waiting_checks')"
+                ).fetchone()[0]
+                if active >= max_parallel:
+                    return None
+            if run_id:
+                row = connection.execute(
+                    "SELECT run_id, stage FROM runs WHERE status = ? AND run_id = ?",
+                    (from_status, run_id),
+                ).fetchone()
+            else:
+                row = connection.execute(
+                    """
+                    SELECT run_id, stage FROM runs
+                    WHERE status = ?
+                    ORDER BY created_at
+                    LIMIT 1
+                    """,
+                    (from_status,),
+                ).fetchone()
             if row is None:
                 return None
+            claimed_stage = stage or row["stage"]
             connection.execute(
-                "UPDATE runs SET status = 'running', owner_pid = ?, updated_at = ? WHERE run_id = ?",
-                (os.getpid(), _now(), row["run_id"]),
+                """
+                UPDATE runs
+                SET status = ?, stage = ?, owner_pid = ?, lease_role = ?,
+                    lease_expires_at = ?, updated_at = ?
+                WHERE run_id = ?
+                """,
+                (
+                    to_status, claimed_stage, os.getpid(), role,
+                    _lease_deadline(lease_seconds), _now(), row["run_id"],
+                ),
             )
             run_id = row["run_id"]
             self._insert_event(
                 connection,
                 run_id=run_id,
-                event_type="run_claimed",
-                stage="queued",
-                status="running",
-                message="Claimed queued run",
-                data={"owner_pid": os.getpid()},
+                event_type=f"{role}_claimed",
+                stage=claimed_stage,
+                status=to_status,
+                message=f"{role.title()} claimed run",
+                data={"owner_pid": os.getpid(), "lease_seconds": lease_seconds},
             )
         return self.get(run_id)
+
+    def claim_for_planning(
+        self, lease_seconds: int, run_id: str | None = None
+    ) -> RunRecord | None:
+        return self._claim(
+            from_status="queued",
+            to_status="planning",
+            stage="analyzing",
+            role="planner",
+            lease_seconds=lease_seconds,
+            run_id=run_id,
+        )
+
+    def claim_ready(
+        self, max_parallel: int, lease_seconds: int, run_id: str | None = None
+    ) -> RunRecord | None:
+        return self._claim(
+            from_status="ready",
+            to_status="running",
+            stage=None,
+            role="worker",
+            lease_seconds=lease_seconds,
+            max_parallel=max_parallel,
+            run_id=run_id,
+        )
+
+    def claim_next(self, max_parallel: int) -> RunRecord | None:
+        """Backward-compatible alias for development workers."""
+        return self.claim_ready(max_parallel, 21600)
+
+    def finish_planning(
+        self,
+        run_id: str,
+        *,
+        plan: dict,
+        risk: str,
+        sessions: dict[str, str] | None = None,
+    ) -> RunRecord:
+        return self.update(
+            run_id,
+            status="ready",
+            stage="ready",
+            plan=plan,
+            risk=risk,
+            sessions=sessions or {},
+            owner_pid=None,
+            lease_role=None,
+            lease_expires_at=None,
+            error=None,
+        )
+
+    def heartbeat(self, run_id: str, role: str, lease_seconds: int) -> RunRecord:
+        record = self.get(run_id)
+        if record.lease_role != role or record.owner_pid != os.getpid():
+            raise RuntimeError(f"run {run_id} is not leased by this {role}")
+        return self.update(run_id, lease_expires_at=_lease_deadline(lease_seconds))
+
+    def reconcile_expired(self) -> list[RunRecord]:
+        """Recover abandoned planning leases and quarantine abandoned development."""
+        reconciled: list[str] = []
+        now = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT * FROM runs
+                WHERE lease_expires_at IS NOT NULL
+                  AND lease_expires_at < ?
+                  AND status IN ('planning', 'running', 'waiting_checks')
+                """,
+                (now,),
+            ).fetchall()
+            for row in rows:
+                current = self._record(row)
+                if current.status == "planning":
+                    status, stage, error = "queued", "queued", "planner lease expired"
+                else:
+                    status, stage = "needs_human", current.stage
+                    error = f"{current.lease_role or 'worker'} lease expired"
+                connection.execute(
+                    """
+                    UPDATE runs
+                    SET status = ?, stage = ?, owner_pid = NULL, lease_role = NULL,
+                        lease_expires_at = NULL, error = ?, updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (status, stage, error, now, current.run_id),
+                )
+                self._insert_event(
+                    connection,
+                    run_id=current.run_id,
+                    event_type="lease_reconciled",
+                    stage=stage,
+                    status=status,
+                    message=error,
+                    data={"previous_status": current.status},
+                )
+                reconciled.append(current.run_id)
+        return [self.get(run_id) for run_id in reconciled]
 
     def get(self, run_id: str) -> RunRecord:
         with self._connect() as connection:
@@ -343,22 +491,57 @@ class RunStore:
             ).fetchall()
         return [self._record(row) for row in rows]
 
+    def find_completed_issue(
+        self, repo: str, issue_number: int, *, exclude_run_id: str | None = None
+    ) -> RunRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM runs
+                WHERE repo = ? AND issue_number = ? AND status = 'completed'
+                  AND (? IS NULL OR run_id != ?)
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (repo, issue_number, exclude_run_id, exclude_run_id),
+            ).fetchone()
+        return self._record(row) if row else None
+
+    def list_submission_recovery_candidates(self) -> list[RunRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM runs
+                WHERE status IN ('failed', 'needs_human')
+                  AND stage = 'submitting'
+                  AND worktree_path IS NOT NULL
+                  AND branch IS NOT NULL
+                ORDER BY updated_at
+                """
+            ).fetchall()
+        return [self._record(row) for row in rows]
+
     def update(self, run_id: str, **fields) -> RunRecord:
         allowed = {
             "status", "stage", "worktree_path", "branch", "pr_url",
-            "risk", "sessions", "error",
+            "risk", "plan", "sessions", "error",
             "touched_files",
             "owner_pid",
+            "lease_role", "lease_expires_at",
         }
         unknown = set(fields) - allowed
         if unknown:
             raise ValueError(f"unsupported run fields: {', '.join(sorted(unknown))}")
         if "sessions" in fields:
             fields["sessions"] = json.dumps(fields["sessions"], sort_keys=True)
+        if "plan" in fields:
+            fields["plan"] = json.dumps(fields["plan"], sort_keys=True)
         if "touched_files" in fields:
             fields["touched_files"] = json.dumps(sorted(set(fields["touched_files"])))
         if fields.get("status") in FINAL_STATUSES:
             fields["owner_pid"] = None
+            fields["lease_role"] = None
+            fields["lease_expires_at"] = None
         fields["updated_at"] = _now()
         assignments = ", ".join(f"{key} = ?" for key in fields)
         values = [*fields.values(), run_id]
@@ -472,10 +655,11 @@ class RunStore:
                     )
                 connection.execute(
                     """
-                    UPDATE runs SET status = 'running', owner_pid = ?, error = NULL, updated_at = ?
+                    UPDATE runs SET status = 'running', owner_pid = ?, lease_role = 'worker',
+                        lease_expires_at = ?, error = NULL, updated_at = ?
                     WHERE run_id = ?
                     """,
-                    (os.getpid(), _now(), run_id),
+                    (os.getpid(), _lease_deadline(21600), _now(), run_id),
                 )
                 self._insert_event(
                     connection,
@@ -512,6 +696,7 @@ class RunStore:
                 """
                 UPDATE runs
                 SET status = 'cancelled', stage = 'cancelled', owner_pid = NULL,
+                    lease_role = NULL, lease_expires_at = NULL,
                     error = 'cancelled by user', updated_at = ?
                 WHERE run_id = ?
                 """,

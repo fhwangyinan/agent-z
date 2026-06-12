@@ -34,13 +34,14 @@ class TaskResumeTests(unittest.TestCase):
             sessions={"developer": "dev-session"},
         )
 
-    @patch("run.CLEANUP_COMPLETED_WORKTREES", False)
-    @patch("run.wait_for_pr_checks", return_value=True)
-    @patch("run.done")
-    @patch("run.step")
-    @patch("run.console")
+    @patch("orchestration.workflow.CLEANUP_COMPLETED_WORKTREES", False)
+    @patch("orchestration.workflow.wait_for_pr_checks", return_value=True)
+    @patch("orchestration.workflow.done")
+    @patch("orchestration.workflow.run_step")
+    @patch("orchestration.workflow.show_run_summary")
+    @patch("orchestration.workflow.console")
     def test_resume_waiting_checks_does_not_repeat_development(
-        self, console, step, done, wait_for_checks
+        self, console, summary, step, done, wait_for_checks
     ):
         analyst = fake_agent("Analyst")
         developer = fake_agent("Developer")
