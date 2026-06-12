@@ -160,6 +160,7 @@ def _create_pr_deterministically(record: RunRecord, metadata: dict | None = None
         ["git", "push", "--set-upstream", "origin", record.branch],
         cwd=record.worktree_path,
         check=False,
+        retry=True,
     )
     if push.returncode != 0:
         details = (push.stderr or push.stdout).strip()
@@ -182,6 +183,9 @@ def _create_pr_deterministically(record: RunRecord, metadata: dict | None = None
         check=False,
     )
     if result.returncode != 0:
+        existing = _find_open_pr_for_branch(record.branch)
+        if existing:
+            return existing
         details = (result.stderr or result.stdout).strip()
         raise NeedsHumanError(f"deterministic PR creation failed: {details}")
     candidate = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""

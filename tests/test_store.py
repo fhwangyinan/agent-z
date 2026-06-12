@@ -140,6 +140,34 @@ class RunStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "queued or active"):
             self.store.enqueue("owner/repo", 1)
 
+    def test_scheduler_can_release_only_its_own_unclaimed_queue(self):
+        scheduled = self.store.enqueue("owner/repo", 1)
+        self.store.add_event(scheduled.run_id, "scheduler_enqueued")
+        manual = self.store.enqueue("owner/repo", 2)
+        self.assertEqual(
+            [record.issue_number for record in self.store.list_scheduler_queued("owner/repo")],
+            [1],
+        )
+        self.assertTrue(self.store.release_scheduler_queued(
+            scheduled.run_id,
+            action="reject",
+            reason="Tracking issue",
+        ))
+        self.assertEqual(self.store.get(scheduled.run_id).status, "skipped")
+        self.assertFalse(self.store.release_scheduler_queued(
+            manual.run_id,
+            action="reject",
+            reason="Should not change",
+        ))
+        self.assertEqual(self.store.get(manual.run_id).status, "queued")
+
+    def test_active_issue_numbers_only_returns_non_final_runs(self):
+        active = self.store.enqueue("owner/repo", 1)
+        final = self.store.enqueue("owner/repo", 2)
+        self.store.update(final.run_id, status="completed")
+        self.store.enqueue("other/repo", 3)
+        self.assertEqual(self.store.active_issue_numbers("owner/repo"), {active.issue_number})
+
     @patch("orchestration.store._pid_alive", return_value=True)
     def test_resume_rejects_run_owned_by_another_live_process(self, pid_alive):
         record = self.store.create("owner/repo", 1, max_parallel=1)

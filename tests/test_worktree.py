@@ -43,6 +43,7 @@ class WorktreeManagerTests(unittest.TestCase):
         path = self.manager.path_for("run-1")
         path.mkdir()
         self.assertEqual(self.manager.validate(path), path)
+        self.assertEqual(execute.call_args.kwargs["errors"], "replace")
 
 
 if __name__ == "__main__":

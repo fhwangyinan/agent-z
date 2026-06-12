@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from agents.runners.base import decode_subprocess_output
 from agents.runners.claude import ClaudeRunner
 from agents.runners.codex import CodexRunner
 from agents.runners.opencode import OpenCodeRunner
@@ -30,6 +31,7 @@ class ClaudeRunnerTests(unittest.TestCase):
             runner.execute("prompt", session_id="session-1")
         self.assertIn("--resume", execute.call_args.args[0])
         self.assertIn("session-1", execute.call_args.args[0])
+        self.assertEqual(execute.call_args.args[1], "prompt")
 
     def test_timeout_retries_explicit_session(self):
         runner = ClaudeRunner(flags=["--flag"])
@@ -52,6 +54,55 @@ class ClaudeRunnerTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "final failure"):
                 runner.execute("prompt")
+
+    def test_missing_resume_session_restarts_original_prompt_fresh(self):
+        runner = ClaudeRunner(flags=["--flag"])
+        payload = json.dumps({"result": "ok", "session_id": "fresh-session"})
+        with patch.object(
+            runner,
+            "_run",
+            side_effect=[
+                result(1, stderr="No conversation found with session ID: stale-session"),
+                result(stdout=payload),
+            ],
+        ) as execute:
+            response = runner.execute("original prompt", session_id="stale-session")
+        retry_args = execute.call_args_list[1].args[0]
+        self.assertNotIn("--resume", retry_args)
+        self.assertEqual(execute.call_args_list[1].args[1], "original prompt")
+        self.assertEqual(response.session_id, "fresh-session")
+
+    def test_missing_session_after_retry_restarts_original_prompt_fresh(self):
+        runner = ClaudeRunner(flags=["--flag"])
+        payload = json.dumps({"result": "ok", "session_id": "fresh-session"})
+        with patch.object(
+            runner,
+            "_run",
+            side_effect=[
+                result(1, stderr="temporary failure"),
+                result(1, stderr="No conversation found with session ID: generated-session"),
+                result(stdout=payload),
+            ],
+        ) as execute:
+            response = runner.execute("original prompt")
+        final_args = execute.call_args_list[2].args[0]
+        self.assertNotIn("--resume", final_args)
+        self.assertEqual(execute.call_args_list[2].args[1], "original prompt")
+        self.assertEqual(response.session_id, "fresh-session")
+
+    def test_long_prompt_is_sent_via_stdin_not_command_line(self):
+        runner = ClaudeRunner(flags=["--flag"])
+        payload = json.dumps({"result": "ok", "session_id": "session-1"})
+        prompt = "x" * 100000
+        with patch.object(runner, "_run", return_value=result(stdout=payload)) as execute:
+            runner.execute(prompt)
+        self.assertNotIn(prompt, execute.call_args.args[0])
+        self.assertEqual(execute.call_args.args[1], prompt)
+
+
+class RunnerOutputDecodingTests(unittest.TestCase):
+    def test_decodes_windows_gbk_error_output(self):
+        self.assertEqual(decode_subprocess_output("命令行太长".encode("gbk")), "命令行太长")
 
 
 class CodexRunnerTests(unittest.TestCase):

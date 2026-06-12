@@ -7,7 +7,7 @@ from datetime import datetime
 
 from rich.console import Console
 
-from agents.base import done, format_duration, log, run_cmd, step, warn
+from agents.base import done, elapsed_status, format_duration, log, run_cmd, step, warn
 from agents.developer import DeveloperAgent
 from config import (
     GITHUB_REPO,
@@ -21,12 +21,12 @@ from config import (
 )
 from orchestration.errors import NeedsHumanError
 from orchestration.store import RunRecord, RunStore
-from orchestration.tui import _show_pr_checks, run_step
+from orchestration.tui import _show_pr_checks, run_step, wait_with_status
 from orchestration.worktree import WorktreeManager
 
 console = Console()
 
-def validate_environment():
+def validate_environment(*, require_backends: bool = True):
     if not os.path.isdir(PROJECT_DIR):
         raise RuntimeError(f"PROJECT_DIR does not exist: {PROJECT_DIR}")
     if not GITHUB_REPO or "/" not in GITHUB_REPO:
@@ -41,7 +41,10 @@ def validate_environment():
     unknown = selected_backends - supported_backends
     if unknown:
         raise RuntimeError(f"unsupported agent backend(s): {', '.join(sorted(unknown))}")
-    for command in ("git", "gh", *sorted(selected_backends)):
+    commands = ["git", "gh"]
+    if require_backends:
+        commands.extend(sorted(selected_backends))
+    for command in commands:
         if not shutil.which(command):
             raise RuntimeError(f"required command not found: {command}")
     result = run_cmd(["git", "rev-parse", "--is-inside-work-tree"], check=False)
@@ -50,7 +53,7 @@ def validate_environment():
 
 def prepare_base_repo():
     step("[SETUP] Refresh base repository")
-    run_cmd(["git", "fetch", "origin", "main"], verbose=True)
+    run_cmd(["git", "fetch", "origin", "main"], verbose=True, retry=True)
     done("Base repository refreshed")
 
 def _get_pr_checks(pr_url: str) -> list[dict] | None:
@@ -80,8 +83,18 @@ def wait_for_pr_checks(pr_url: str, record: RunRecord | None = None) -> bool:
     deadline = time.monotonic() + PR_CHECKS_MAX_WAIT
     checks = _get_pr_checks(pr_url)
     while checks == [] and time.monotonic() < deadline:
-        log("[dim]No checks reported yet; retrying...[/dim]")
-        time.sleep(min(PR_CHECKS_INTERVAL, max(0, deadline - time.monotonic())))
+        delay = min(PR_CHECKS_INTERVAL, max(0, deadline - time.monotonic()))
+        wait_with_status(
+            "PR checks",
+            lambda: (
+                f"waiting for checks to register | "
+                f"elapsed:{format_duration(time.monotonic() - started)} | "
+                f"budget left:{format_duration(deadline - time.monotonic())}"
+            ),
+            max(1, int(delay)),
+            style="magenta",
+            sleep=time.sleep,
+        )
         checks = _get_pr_checks(pr_url)
 
     if checks is None:
@@ -93,7 +106,13 @@ def wait_for_pr_checks(pr_url: str, record: RunRecord | None = None) -> bool:
 
     remaining = max(1, int(deadline - time.monotonic()))
     try:
-        with console.status("[dim]Watching PR checks...[/dim]", spinner="dots"):
+        with elapsed_status(
+            "Watching PR checks",
+            style="magenta",
+            details=lambda: (
+                f"budget left:{format_duration(deadline - time.monotonic())}"
+            ),
+        ):
             run_cmd(
                 [
                     "gh", "pr", "checks", pr_url, "--watch",
@@ -102,6 +121,7 @@ def wait_for_pr_checks(pr_url: str, record: RunRecord | None = None) -> bool:
                 check=False,
                 timeout=remaining,
                 verbose=True,
+                retry=False,
             )
     except subprocess.TimeoutExpired:
         warn("Timed out while waiting for PR checks")
@@ -160,7 +180,7 @@ def _get_issue_snapshot(issue_number: int) -> dict | None:
         [
             "gh", "issue", "view", str(issue_number),
             "--repo", GITHUB_REPO,
-            "--json", "state,labels,updatedAt",
+            "--json", "state,labels,assignees,updatedAt",
         ],
         check=False,
     )
@@ -240,6 +260,19 @@ def preflight_worker(record: RunRecord, store: RunStore) -> RunRecord:
             error=f"issue has active-work label(s): {', '.join(conflicts)}",
         )
 
+    assignees = [
+        assignee.get("login", "")
+        for assignee in snapshot.get("assignees", [])
+        if assignee.get("login")
+    ]
+    if assignees:
+        return store.update(
+            record.run_id,
+            status="skipped",
+            stage="skipped",
+            error=f"issue is assigned to: {', '.join(assignees)}",
+        )
+
     prs = _get_related_open_prs(record.issue_number)
     if prs is None:
         raise RuntimeError(f"could not query related open PRs for issue #{record.issue_number}")
@@ -308,6 +341,15 @@ def _label_exists(label: str) -> bool | None:
     )
 
 def _ensure_label_exists(label: str):
+    # 1. Check if label already exists
+    exists = _label_exists(label)
+    if exists:
+        return
+    if exists is None:
+        # Query failed, but don't abort — try to create anyway
+        pass
+
+    # 2. Create the label
     result = run_cmd(
         [
             "gh", "label", "create", label,
@@ -319,8 +361,11 @@ def _ensure_label_exists(label: str):
     )
     if result.returncode == 0:
         return
+
+    # 3. Creation failed — maybe another process created it in the meantime
     if _label_exists(label):
         return
+
     details = (result.stderr or result.stdout).strip()
     raise NeedsHumanError(
         f"could not create or verify required label {label!r}: {details}"
@@ -416,13 +461,20 @@ def _remove_run_claim_label(record: RunRecord, store: RunStore):
         ],
         check=False,
     )
+    updated_labels = None
     if result.returncode != 0:
-        details = (result.stderr or result.stdout).strip()
-        raise RuntimeError(
-            f"could not remove active-work label {label!r} from "
-            f"issue #{record.issue_number}: {details}"
-        )
-    updated_labels = _get_issue_labels(record.issue_number)
+        updated_labels = _get_issue_labels(record.issue_number)
+        if (
+            updated_labels is None
+            or label.lower() in {item.lower() for item in updated_labels}
+        ):
+            details = (result.stderr or result.stdout).strip()
+            raise RuntimeError(
+                f"could not remove active-work label {label!r} from "
+                f"issue #{record.issue_number}: {details}"
+            )
+    if updated_labels is None:
+        updated_labels = _get_issue_labels(record.issue_number)
     if (
         updated_labels is None
         or label.lower() in {item.lower() for item in updated_labels}

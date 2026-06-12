@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import locale
+import os
 from typing import Literal
 
 
@@ -20,6 +22,20 @@ class BackendCapabilities:
 class AgentResult:
     output: str
     session_id: str | None = None
+
+
+def decode_subprocess_output(data: bytes | str | None) -> str:
+    if data is None or isinstance(data, str):
+        return data or ""
+    encodings = ["utf-8", locale.getpreferredencoding(False)]
+    if os.name == "nt":
+        encodings.extend(["gbk", "cp936"])
+    for encoding in dict.fromkeys(encodings):
+        try:
+            return data.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return data.decode("utf-8", errors="replace")
 
 
 class AgentRunner(ABC):

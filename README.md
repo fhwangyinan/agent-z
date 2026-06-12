@@ -32,8 +32,27 @@ cp .env.example .env        # edit with your settings
 
 ## Usage
 
+For normal operation, only three commands are needed:
+
+```bash
+python run.py --serve              # recommended: start the complete autonomous service
+python run.py --list-runs          # list recent runs
+python run.py --inspect RUN_ID     # inspect one run and its event timeline
+```
+
+`--serve` starts one Scheduler, one Planner, one Reconciler, and
+`SERVICE_WORKERS` Worker processes. Crashed child processes are restarted, and
+`Ctrl+C` stops the complete service. Use `--serve --workers 4` to override the
+Worker count and set that service's task concurrency to four. Default `--help`
+shows normal commands only; use `--help-all` for pool-level and tuning options.
+
+The remaining commands are intended for single-task operation, diagnostics, or
+independent scaling:
+
 ```bash
 python run.py                       # interactive: confirm & Q&A each round
+python run.py --serve               # start the complete autonomous service
+python run.py --serve --workers 4   # start the service with four Workers
 python run.py --loop 5              # autonomous: 5 rounds, skip high-risk issues
 python run.py --loop 5 --force      # autonomous: develop all issues regardless of risk
 python run.py --issue 123           # run one unattended issue in an isolated worktree
@@ -46,9 +65,28 @@ python run.py --inspect RUN_ID      # show run metadata and structured events
 python run.py --cancel RUN_ID       # release locks and remove an abandoned worktree
 python run.py --worker              # continuously claim planned, ready tasks
 python run.py --planner             # continuously turn queued issues into execution plans
+python run.py --scheduler           # continuously discover and enqueue eligible issues
+python run.py --schedule-once       # run one scheduling scan
 python run.py --reconciler          # continuously recover expired leases
 python run.py --reconcile-once      # recover expired leases once
 ```
+
+The scheduler uses deterministic checks only as safety gates, then asks a
+dedicated Scheduler Agent to semantically assess and rank the remaining issues.
+The Agent rejects tracking/meta issues, epics, roadmaps, discussions, vague
+requests, and other work that is not independently deliverable. It ranks
+actionable work by expected value, urgency, benefit breadth, confidence, cost,
+risk, and whether it unlocks other work. Labels are treated as hints.
+
+GitHub remains the shared coordination source. Before Agent assessment, the
+scheduler skips assigned issues, active-work labels, related open PRs, and
+same-repository dependencies declared with `Blocked by #123`, `Depends on
+#123`, or `Requires #123`. The Scheduler Agent receives only the candidate issue
+numbers and inspects their current GitHub state itself. Agent decisions are
+fail-closed, recorded in the event log, and reconsidered on each scan.
+Previously Scheduler-enqueued tasks that have not been claimed by a Planner are
+also re-evaluated, while manually enqueued and already claimed tasks are left
+untouched.
 
 `--cancel` refuses to remove a task that is still owned by a live Agent-Z process. Use it for queued, stopped, or abandoned runs.
 
@@ -67,7 +105,9 @@ The terminal output is designed to remain useful both interactively and in unatt
 
 - Every major stage displays the full Run ID, Issue number, status, stage, lease role, and cumulative elapsed time.
 - Agent calls report backend/session mode and execution time.
-- Worker, Planner, and Reconciler processes display startup configuration, idle heartbeats, claimed counts, uptime, and next scan time.
+- Worker, Planner, Scheduler, and Reconciler idle countdowns refresh in place instead of appending heartbeat lines.
+- `--serve` displays one live service health line; task, error, and restart events remain normal log lines.
+- Agent calls show live elapsed time; PR check registration, check watching, and service restarts show dynamic timing status.
 - PR checks render as a result table with total wait time.
 - Completed, skipped, failed, interrupted, and `needs_human` runs render consistent terminal summaries.
 - `--list-runs` shows a color-coded status overview, run age, leases, PRs, and errors.
@@ -87,6 +127,8 @@ The terminal output is designed to remain useful both interactively and in unatt
 
 | Flag | Effect |
 |------|--------|
+| `--serve` | Start the complete Scheduler, Planner, Worker, and Reconciler service |
+| `--workers N` | Set the Worker count started by `--serve` |
 | `--loop N` | Run N rounds automatically |
 | `--force` | Ignore risk levels, develop all issues |
 | `--issue N` | Run one issue immediately |
@@ -186,16 +228,30 @@ Copy `.env.example` to `.env` and edit. Full options:
 | `TIMEOUT_DEVELOPER` | Developer timeout (s) | 10800 |
 | `TIMEOUT_REVIEWER` | Reviewer timeout (s) | 1800 |
 | `RETRY_TIMEOUT` | Retry timeout (s) | 3600 |
+| `GITHUB_RETRY_ATTEMPTS` | Maximum attempts for GitHub CLI and explicit network Git operations | 3 |
+| `GITHUB_RETRY_BASE_DELAY` | Initial transient-failure retry delay (s) | 2 |
+| `GITHUB_RETRY_MAX_DELAY` | Maximum exponential backoff delay (s) | 30 |
+| `GITHUB_COMMAND_TIMEOUT` | Per-command timeout for GitHub/Git network calls without an explicit timeout (s) | 60 |
 | `PR_CHECKS_INTERVAL` | PR checks watch interval (s) | 10 |
 | `PR_CHECKS_MAX_WAIT` | Max wait for PR checks (s) | 900 |
 | `MAX_REVIEW_ROUNDS` | Max review-fix loops | 5 |
 | `MAX_LOCAL_REVIEW_ROUNDS` | Max local review loops | 5 |
 | `MAX_PARALLEL_TASKS` | Maximum active tasks across processes | 2 |
+| `SERVICE_WORKERS` | Default Worker count for `--serve` | `MAX_PARALLEL_TASKS` |
+| `SERVICE_RESTART_DELAY` | Delay before restarting a crashed service child (s) | 5 |
 | `MAX_RUN_SECONDS` | Per-attempt runtime budget | 21600 |
 | `CLEANUP_COMPLETED_WORKTREES` | Remove worktrees after successful completion | `true` |
 | `CLEANUP_FAILED_WORKTREES` | Remove failed/needs-human worktrees while preserving branch and label | `false` |
 | `WORKER_IDLE_SLEEP` | Queue worker sleep when no task is available | 30 |
 | `PLANNER_IDLE_SLEEP` | Planner sleep when no issue awaits analysis | 30 |
+| `SCHEDULER_IDLE_SLEEP` | Seconds between Scheduler scans | 60 |
+| `SCHEDULER_BATCH_SIZE` | Maximum Agent-approved issues enqueued per scan | 10 |
+| `SCHEDULER_ISSUE_LIMIT` | Maximum open issues fetched per scan | 100 |
+| `SCHEDULER_AGENT_CANDIDATE_LIMIT` | Maximum hard-filtered candidates assessed by the Scheduler Agent per scan | `SCHEDULER_ISSUE_LIMIT` |
+| `SCHEDULER_ELIGIBLE_LABELS` | Required scheduling labels; empty allows all open issues | — |
+| `SCHEDULER_BLOCK_LABELS` | Labels that prevent automatic scheduling | `blocked` |
+| `SCHEDULER_SKIP_ASSIGNED_ISSUES` | Skip issues with assignees | `true` |
+| `SCHEDULER_PRIORITY_LABELS` | Label hints used to build the Agent candidate shortlist | `priority:critical,...` |
 | `RECONCILER_INTERVAL` | Seconds between expired-lease scans | 60 |
 | `PLANNER_LEASE_SECONDS` | Planner claim lifetime | 7200 |
 | `WORKER_LEASE_SECONDS` | Worker claim lifetime | 21600 |

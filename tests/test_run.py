@@ -111,10 +111,10 @@ class PrChecksTests(QuietRunTest):
         run_cmd.return_value = result()
         self.assertFalse(run.wait_for_pr_checks("https://example/pr/1"))
 
-    @patch("orchestration.github_ops.time.sleep")
+    @patch("orchestration.github_ops.wait_with_status")
     @patch("orchestration.github_ops.run_cmd")
     @patch("orchestration.github_ops._get_pr_checks")
-    def test_waits_for_checks_to_register(self, get_checks, run_cmd, sleep):
+    def test_waits_for_checks_to_register(self, get_checks, run_cmd, wait_status):
         get_checks.side_effect = [
             [],
             [{"name": "CI", "bucket": "pending"}],
@@ -122,7 +122,7 @@ class PrChecksTests(QuietRunTest):
         ]
         run_cmd.return_value = result()
         self.assertTrue(run.wait_for_pr_checks("https://example/pr/1"))
-        sleep.assert_called_once()
+        wait_status.assert_called_once()
 
     @patch("orchestration.github_ops.run_cmd", side_effect=subprocess.TimeoutExpired("gh", 1))
     @patch("orchestration.github_ops._get_pr_checks")
@@ -163,6 +163,7 @@ class SkipLabelTests(QuietRunTest):
             result(stdout='{"labels": []}'),
             result(),
             result(),
+            result(),
             result(stdout='{"labels": [{"name": "ongoing"}]}'),
         ]
         record = SimpleNamespace(
@@ -176,8 +177,8 @@ class SkipLabelTests(QuietRunTest):
         store.get.return_value = record
         returned = run.mark_issue_with_skip_label(record, store)
         self.assertIs(returned, record)
-        self.assertEqual(run_cmd.call_args_list[2].args[0][:3], ["gh", "issue", "edit"])
-        self.assertIn("ongoing", run_cmd.call_args_list[2].args[0])
+        self.assertEqual(run_cmd.call_args_list[3].args[0][:3], ["gh", "issue", "edit"])
+        self.assertIn("ongoing", run_cmd.call_args_list[3].args[0])
         store.add_event.assert_called_once()
         self.assertEqual(store.add_event.call_args.args[1], "issue_labeled_skip")
 
@@ -185,6 +186,7 @@ class SkipLabelTests(QuietRunTest):
     def test_mark_issue_stops_when_required_label_cannot_be_created(self, run_cmd):
         run_cmd.side_effect = [
             result(stdout='{"labels": []}'),
+            result(stdout="[]"),
             result(returncode=1, stderr="permission denied"),
             result(stdout="[]"),
         ]
@@ -198,7 +200,7 @@ class SkipLabelTests(QuietRunTest):
         store.list_events.return_value = []
         with self.assertRaisesRegex(run.NeedsHumanError, "could not create or verify"):
             run.mark_issue_with_skip_label(record, store)
-        self.assertEqual(run_cmd.call_count, 3)
+        self.assertEqual(run_cmd.call_count, 4)
         store.add_event.assert_not_called()
 
     @patch("orchestration.github_ops.run_cmd")
@@ -294,6 +296,29 @@ class WorkerPreflightTests(QuietRunTest):
         self.assertIs(run.preflight_worker(record, store), skipped)
         self.assertEqual(store.update.call_args.kwargs["status"], "skipped")
 
+    @patch("orchestration.github_ops._get_related_open_prs")
+    @patch("orchestration.github_ops._get_issue_snapshot")
+    def test_assigned_issue_skips_external_work(self, issue_snapshot, related_prs):
+        issue_snapshot.return_value = {
+            "state": "OPEN",
+            "labels": [],
+            "assignees": [{"login": "someone-else"}],
+            "updatedAt": "same",
+        }
+        record = SimpleNamespace(
+            run_id="run-1",
+            repo="owner/repo",
+            issue_number=1,
+            plan={"issue_updated_at": "same"},
+        )
+        skipped = SimpleNamespace(status="skipped")
+        store = Mock()
+        store.find_completed_issue.return_value = None
+        store.update.return_value = skipped
+        self.assertIs(run.preflight_worker(record, store), skipped)
+        self.assertIn("assigned to", store.update.call_args.kwargs["error"])
+        related_prs.assert_not_called()
+
 
 class SubmissionRecoveryTests(QuietRunTest):
     @patch("orchestration.submission.run_cmd")
@@ -356,6 +381,31 @@ class SubmissionRecoveryTests(QuietRunTest):
         commands = [call.args[0][:3] for call in run_cmd.call_args_list]
         self.assertIn(["git", "push", "--set-upstream"], commands)
         self.assertIn(["gh", "pr", "create"], commands)
+
+    @patch(
+        "orchestration.submission._find_open_pr_for_branch",
+        side_effect=["", "https://example/pr/recovered"],
+    )
+    @patch("orchestration.submission._issue_title_for_pr", return_value="Fix issue")
+    @patch("orchestration.submission.run_cmd")
+    def test_pr_create_failure_adopts_pr_created_before_network_failure(
+        self, run_cmd, issue_title, find
+    ):
+        run_cmd.side_effect = [
+            result(stdout=""),
+            result(),
+            result(returncode=1, stderr="connection reset"),
+        ]
+        record = SimpleNamespace(
+            run_id="run-1",
+            issue_number=1,
+            branch="agent-z/1-run",
+            worktree_path="worktree",
+        )
+        self.assertEqual(
+            orchestration.submission._create_pr_deterministically(record),
+            "https://example/pr/recovered",
+        )
 
     @patch("orchestration.submission._issue_title_for_pr", return_value="Fallback title")
     def test_submission_metadata_is_sanitized_and_closes_issue(self, issue_title):
@@ -434,6 +484,36 @@ class CleanupTests(QuietRunTest):
         event_types = [call.args[1] for call in store.add_event.call_args_list]
         self.assertIn("issue_claim_label_removed", event_types)
         self.assertIn("worktree_removed", event_types)
+
+    @patch("orchestration.github_ops._get_issue_labels", side_effect=[["ongoing"], []])
+    @patch(
+        "orchestration.github_ops.run_cmd",
+        return_value=result(returncode=1, stderr="connection reset"),
+    )
+    def test_cleanup_accepts_verified_label_removal_after_network_failure(
+        self, run_cmd, labels
+    ):
+        record = SimpleNamespace(
+            run_id="run-1",
+            issue_number=1,
+            stage="completed",
+            status="completed",
+            worktree_path=None,
+        )
+        event = SimpleNamespace(
+            event_type="issue_labeled_skip",
+            data={"label": "ongoing"},
+        )
+        store = Mock()
+        store.list_events.return_value = [event]
+        self.assertTrue(run.cleanup_run_artifacts(
+            record,
+            store,
+            Mock(),
+            remove_worktree=False,
+            remove_label=True,
+        ))
+        self.assertEqual(store.add_event.call_args.args[1], "issue_claim_label_removed")
 
     @patch("orchestration.github_ops.run_cmd")
     def test_cleanup_does_not_remove_label_not_owned_by_run(self, run_cmd):
@@ -515,6 +595,31 @@ class ValidationTests(QuietRunTest):
         with patch("orchestration.github_ops.TASK_LEAD_BACKEND", "claude"), \
              patch("orchestration.github_ops.REVIEWER_BACKEND", "codex"):
             orchestration.pools.validate_environment()
+
+
+class CliTests(QuietRunTest):
+    def test_serve_accepts_worker_count(self):
+        parser = run.build_parser()
+        args = parser.parse_args(["--serve", "--workers", "4"])
+        run._validate_args(parser, args)
+        self.assertTrue(args.serve)
+        self.assertEqual(args.workers, 4)
+
+    def test_workers_requires_serve(self):
+        parser = run.build_parser()
+        args = parser.parse_args(["--workers", "4"])
+        with self.assertRaises(SystemExit):
+            run._validate_args(parser, args)
+
+    def test_default_help_hides_advanced_options(self):
+        help_text = run.build_parser().format_help()
+        self.assertIn("--serve", help_text)
+        self.assertIn("--help-all", help_text)
+        self.assertNotIn("--worker-idle-sleep", help_text)
+
+    def test_help_all_shows_advanced_options(self):
+        help_text = run.build_parser(show_advanced=True).format_help()
+        self.assertIn("--worker-idle-sleep", help_text)
 
 
 class TaskLeadSessionTests(QuietRunTest):

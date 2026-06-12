@@ -2,10 +2,13 @@ import json
 import os
 import time
 from datetime import datetime, timezone
+from typing import Callable
 
 from rich import box
 from rich.align import Align
 from rich.console import Console
+from rich.live import Live
+from rich.spinner import Spinner
 from rich.panel import Panel
 from rich.prompt import IntPrompt, Prompt
 from rich.table import Table
@@ -63,7 +66,7 @@ def show_banner():
         Panel.fit(
             table,
             title=f"[bold cyan]Agent-Z v{__version__}[/bold cyan]",
-            subtitle="[dim]Planner Pool | Worker Pool | Reconciler[/dim]",
+            subtitle="[dim]Scheduler | Planner Pool | Worker Pool | Reconciler[/dim]",
             border_style="cyan",
             padding=(0, 4),
         )
@@ -161,6 +164,32 @@ def show_pool_status(role: str, state: str, details: str, *, style: str = "cyan"
             padding=(0, 2),
         )
     )
+
+def wait_with_status(
+    role: str,
+    details: str | Callable[[], str],
+    seconds: int,
+    *,
+    style: str = "cyan",
+    sleep=time.sleep,
+):
+    if os.environ.get("AGENT_Z_QUIET_IDLE") == "1":
+        sleep(seconds)
+        return
+    deadline = time.monotonic() + seconds
+    spinner = Spinner("dots", style=style)
+    with Live(console=console, refresh_per_second=4, transient=True) as live:
+        while True:
+            remaining = max(0, int(deadline - time.monotonic() + 0.999))
+            current_details = details() if callable(details) else details
+            spinner.update(
+                text=f"[bold {style}]{role} idle[/bold {style}] "
+                f"[dim]| {current_details} | next scan:{remaining}s[/dim]"
+            )
+            live.update(spinner)
+            if remaining <= 0:
+                break
+            sleep(min(1, remaining))
 
 def _show_pr_checks(checks: list[dict], elapsed: float):
     table = Table(

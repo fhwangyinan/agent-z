@@ -7,9 +7,9 @@
 通过 Claude Code、Codex 或 OpenCode，将确定性控制平面、灵活的 Task Lead、独立 Reviewer、可扩缩 Worker 与 Reconciler 组合起来。
 
 ```
-Open Issues/PRs ← 按需探索 ← Task Lead（选择 + 规划 + 开发）
-                               ↓
-持久化队列 → Worker Pool → 独立 Reviewer → 确定性 Coordinator
+Open Issues/PRs → Scheduler（资格 + 优先级 + 依赖）→ 持久化队列
+                                                        ↓
+                         Planner Pool → Worker Pool → 独立 Reviewer → 确定性 Coordinator
                   ↘              Reconciler              ↗
 ```
 
@@ -32,8 +32,26 @@ cp .env.example .env        # 按需修改配置
 
 ## 使用
 
+日常使用只需要记住三个入口：
+
+```bash
+python run.py --serve              # 推荐：一键启动完整自治服务
+python run.py --list-runs          # 查看最近任务
+python run.py --inspect RUN_ID     # 查看某个任务及事件时间线
+```
+
+`--serve` 会启动一个 Scheduler、一个 Planner、一个 Reconciler，以及默认
+`SERVICE_WORKERS` 个 Worker。任一子进程异常退出后会自动重启；按 `Ctrl+C`
+统一停止全部进程。可用 `python run.py --serve --workers 4` 临时覆盖 Worker 数量，
+并将本次服务的最大并发任务数设为 4。
+默认 `--help` 只展示日常命令；使用 `python run.py --help-all` 查看池级和调参命令。
+
+以下命令用于单任务处理、调试或独立扩缩：
+
 ```bash
 python run.py                       # 交互模式：每轮确认 + 影响评估问答
+python run.py --serve               # 一键启动完整自治服务
+python run.py --serve --workers 4   # 一键启动并使用 4 个 Worker
 python run.py --loop 5              # 自主模式：5 轮，跳过高风险 issue
 python run.py --loop 5 --force      # 自主模式：忽略风险级别，全部开发
 python run.py --issue 123           # 在独立 worktree 中无人值守处理一个 issue
@@ -46,6 +64,8 @@ python run.py --inspect RUN_ID      # 查看任务元数据和结构化事件
 python run.py --cancel RUN_ID       # 释放锁并清理废弃 worktree
 python run.py --worker              # 持续领取已完成规划的 ready 任务
 python run.py --planner             # 持续分析 issue 并生成结构化执行计划
+python run.py --scheduler           # 持续发现、排序并入队可执行 issue
+python run.py --schedule-once       # 执行一次 issue 调度扫描
 python run.py --reconciler          # 持续回收过期租约
 python run.py --reconcile-once      # 执行一次租约回收
 ```
@@ -56,6 +76,7 @@ python run.py --reconcile-once      # 执行一次租约回收
 
 ```bash
 python run.py --planner
+python run.py --scheduler
 python run.py --worker
 python run.py --worker
 python run.py --reconciler
@@ -67,7 +88,9 @@ python run.py --reconciler
 
 - 每个关键阶段展示完整 Run ID、Issue 编号、状态、阶段、租约角色和累计耗时。
 - Agent 调用展示后端/session 模式与执行耗时。
-- Worker、Planner、Reconciler 展示启动配置、空闲心跳、已领取数量、运行时间和下次扫描时间。
+- Worker、Planner、Scheduler、Reconciler 的空闲倒计时和运行时间在同一行实时刷新，不持续堆积 heartbeat 日志。
+- `--serve` 统一显示一条服务存活进程数与运行时间状态；任务、错误和重启事件仍保留为正常日志行。
+- Agent 调用会实时显示已运行时间；PR checks 注册等待、检查等待和服务重启会显示动态时间状态。
 - PR Checks 使用结果表展示，并包含总等待时间。
 - 完成、跳过、失败、中断和 `needs_human` 使用统一终态摘要。
 - `--list-runs` 展示带颜色的状态总览、任务年龄、租约、PR 和错误。
@@ -87,6 +110,8 @@ python run.py --reconciler
 
 | 参数 | 效果 |
 |------|------|
+| `--serve` | 启动 Scheduler、Planner、Worker 与 Reconciler 完整服务 |
+| `--workers N` | 设置 `--serve` 启动的 Worker 数量 |
 | `--loop N` | 自动运行 N 轮 |
 | `--force` | 忽略风险级别，全部开发 |
 | `--issue N` | 立即执行一个 Issue |
@@ -96,6 +121,8 @@ python run.py --reconciler
 | `--resume RUN_ID` | 恢复失败或中断的任务 |
 | `--inspect RUN_ID` | 查看持久化元数据和结构化事件时间线 |
 | `--planner` | 启动一个可独立扩缩的 Planner 进程 |
+| `--scheduler` | 持续扫描并按优先级入队无阻塞 Issue |
+| `--schedule-once` | 执行一次调度扫描 |
 | `--worker` | 启动一个可独立扩缩的开发 Worker |
 | `--reconciler` | 持续恢复过期 Planner/Worker 租约 |
 | `--reconcile-once` | 执行一次过期租约恢复 |
@@ -106,7 +133,7 @@ python run.py --reconciler
 
 每轮执行：
 
-1. **Issue 入队** — 将 Issue 持久化到分析队列。
+1. **Issue 调度与入队** — Scheduler 先用确定性规则跳过已有 assignee、活动标签、相关 open PR 或未关闭依赖的 Issue，再只把候选 Issue 编号交给专职 Scheduler Agent，由 Agent 自行通过 `gh` 查看最新正文、标签、引用、相关 PR 和代码，判断候选是否是可独立交付的代码任务，并按预期收益、紧迫度、影响面、置信度、成本、风险和解锁价值排序。Tracking/meta issue、epic、roadmap、讨论、模糊请求等会被拒绝；标签只作为提示。Issue 正文可用 `Blocked by #123`、`Depends on #123` 或 `Requires #123` 声明依赖；互不依赖的高价值 Issue 会批量入队并可并行执行。Agent 输出异常时本轮不会入队，决策会写入事件日志并在每轮重新判断。旧版 Scheduler 已入队但尚未被 Planner 领取的任务也会重新审查；手动入队和已领取任务不会被自动取消。
 2. **Task Lead 规划** — 按需探索相关 open Issue/PR，分析 Issue、评估影响、把可读结论写入 Issue，并持久化版本化结构执行计划：
    - `very_low` — 无影响
    - `low` — 轻微影响
@@ -130,6 +157,7 @@ run.py                    精简 CLI 入口与兼容导出
 config.py                 从 .env 加载的配置
 orchestration/
   store.py                SQLite 队列、流程状态、Issue 与文件锁
+  scheduler.py            Issue 安全过滤、Agent 语义调度与依赖解析
   worktree.py             独立 worktree 生命周期
   runtime.py              可变 CLI/运行时选项
   errors.py               共享流程异常
@@ -152,7 +180,9 @@ agents/
 
 规划与开发共享一个持久化的 `task_lead` 后端 session。Reviewer 保持独立 session，Coordinator 则负责确定性的生命周期与 GitHub 操作。
 
-每个持久化任务拥有唯一 Run ID、结构化执行计划、流程阶段和角色租约。任意数量的 Planner 与 Worker 进程可以分别竞争各自队列；SQLite 提供原子领取和 Issue 锁，预测文件与实际改动文件登记会阻止活跃任务冲突。Reconciler 会重新排队废弃的 Planner 租约，并把废弃开发任务转为 `needs_human`。
+每个持久化任务拥有唯一 Run ID、结构化执行计划、流程阶段和角色租约。Scheduler 以 GitHub 为共享协作事实源，避开已分配、已有活动标签或相关 open PR 的 Issue；任意数量的 Planner 与 Worker 进程可以分别竞争各自队列。SQLite 提供本实例内的原子领取和 Issue 锁，预测文件与实际改动文件登记会阻止活跃任务冲突。Worker 开工前会再次检查 GitHub 状态，降低与外部协作者同时开工的风险。Reconciler 会重新排队废弃的 Planner 租约，并把废弃开发任务转为 `needs_human`。
+
+跨团队协作时，建议所有人统一遵守“开始处理就 assign 自己或添加 `SKIP_LABELS` 中的活动标签，尽早创建 draft PR”的约定。GitHub label/assignee 本身不提供原子抢锁，因此极端情况下两个参与者在同一瞬间开工仍可能竞争；需要严格互斥时，应在仓库侧增加 GitHub Action 或外部锁服务。
 
 开发前，Agent-Z 会确认必需的进行中 label 已真正添加。提交阶段由 Task Lead 根据最终 diff 生成 commit message、PR 标题和 PR 描述；Coordinator 校验这些元数据后，确定性地提交残留改动、推送任务分支、调用 `gh pr create`，并通过 GitHub 验证结果。Agent 元数据无效时会使用安全模板兜底。分支上预先存在的 PR 会明确记录为“接管外部 PR”。
 
@@ -186,16 +216,30 @@ Task Lead 只在需要时通过有针对性、可分页的查询探索 open Issu
 | `TIMEOUT_DEVELOPER` | Developer 超时 (秒) | 10800 |
 | `TIMEOUT_REVIEWER` | Reviewer 超时 (秒) | 1800 |
 | `RETRY_TIMEOUT` | 重试超时 (秒) | 3600 |
+| `GITHUB_RETRY_ATTEMPTS` | GitHub CLI 与显式网络 Git 操作的最大尝试次数 | 3 |
+| `GITHUB_RETRY_BASE_DELAY` | 瞬时网络失败首次重试等待秒数 | 2 |
+| `GITHUB_RETRY_MAX_DELAY` | 指数退避最大等待秒数 | 30 |
+| `GITHUB_COMMAND_TIMEOUT` | 未显式设置 timeout 的单次 GitHub/Git 网络命令超时秒数 | 60 |
 | `PR_CHECKS_INTERVAL` | PR Checks watch 间隔 (秒) | 10 |
 | `PR_CHECKS_MAX_WAIT` | PR Checks 最大等待 (秒) | 900 |
 | `MAX_REVIEW_ROUNDS` | Review 最大轮次 | 5 |
 | `MAX_LOCAL_REVIEW_ROUNDS` | 本地 Review 最大轮次 | 5 |
 | `MAX_PARALLEL_TASKS` | 跨进程最大活跃任务数 | 2 |
+| `SERVICE_WORKERS` | `--serve` 默认启动的 Worker 数量 | `MAX_PARALLEL_TASKS` |
+| `SERVICE_RESTART_DELAY` | 服务子进程异常退出后的重启等待秒数 | 5 |
 | `MAX_RUN_SECONDS` | 单次执行时间预算 | 21600 |
 | `CLEANUP_COMPLETED_WORKTREES` | 成功后删除 worktree | `true` |
 | `CLEANUP_FAILED_WORKTREES` | 失败/needs-human 后删除 worktree，但保留分支与 label | `false` |
 | `WORKER_IDLE_SLEEP` | 队列 worker 空闲时的 sleep 秒数 | 30 |
 | `PLANNER_IDLE_SLEEP` | Planner 无待分析 Issue 时的 sleep 秒数 | 30 |
+| `SCHEDULER_IDLE_SLEEP` | Scheduler 扫描间隔秒数 | 60 |
+| `SCHEDULER_BATCH_SIZE` | 每轮最多入队的 Issue 数 | 10 |
+| `SCHEDULER_ISSUE_LIMIT` | 每轮最多扫描的 open Issue 数 | 100 |
+| `SCHEDULER_AGENT_CANDIDATE_LIMIT` | 每轮最多交给 Scheduler Agent 判断的候选数 | `SCHEDULER_ISSUE_LIMIT` |
+| `SCHEDULER_ELIGIBLE_LABELS` | 可调度标签；留空表示所有 open Issue | — |
+| `SCHEDULER_BLOCK_LABELS` | 阻止自动入队的标签 | `blocked` |
+| `SCHEDULER_SKIP_ASSIGNED_ISSUES` | 跳过已有 assignee 的 Issue | `true` |
+| `SCHEDULER_PRIORITY_LABELS` | 构建 Agent 候选短名单时使用的优先级标签提示 | `priority:critical,...` |
 | `RECONCILER_INTERVAL` | 过期租约扫描间隔秒数 | 60 |
 | `PLANNER_LEASE_SECONDS` | Planner 租约时长 | 7200 |
 | `WORKER_LEASE_SECONDS` | Worker 租约时长 | 21600 |

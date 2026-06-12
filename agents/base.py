@@ -1,6 +1,8 @@
 import re
+import os
 import subprocess
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime
@@ -14,6 +16,10 @@ from config import (
     GITHUB_REPO,
     CLAUDE_FLAGS,
     CODEX_FLAGS,
+    GITHUB_COMMAND_TIMEOUT,
+    GITHUB_RETRY_ATTEMPTS,
+    GITHUB_RETRY_BASE_DELAY,
+    GITHUB_RETRY_MAX_DELAY,
     OPENCODE_FLAGS,
     RETRY_TIMEOUT,
 )
@@ -33,12 +39,14 @@ def create_runner(name: str) -> AgentRunner:
         raise ValueError(f"Unknown backend {name!r}. Supported backends: {supported}") from exc
 
 AGENT_ICONS = {
+    "Scheduler": "S",
     "Analyst":   "A",
     "Developer": "D",
     "Reviewer":  "R",
 }
 
 AGENT_COLORS = {
+    "Scheduler": "blue",
     "Analyst":   "cyan",
     "Developer": "green",
     "Reviewer":  "magenta",
@@ -83,20 +91,118 @@ def _short_output(text: str | None, limit: int = 1000) -> str:
     return text if len(text) <= limit else text[:limit] + "..."
 
 
-def run_cmd(cmd, cwd=PROJECT_DIR, check=True, capture_output=True, shell=False, timeout=None, verbose=False):
+_TRANSIENT_COMMAND_ERRORS = (
+    "connection reset",
+    "connection refused",
+    "connection timed out",
+    "could not resolve host",
+    "context deadline exceeded",
+    "eof",
+    "failed to connect",
+    "gateway timeout",
+    "http 429",
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+    "internal server error",
+    "network is unreachable",
+    "rate limit",
+    "remote end hung up",
+    "secondary rate limit",
+    "service unavailable",
+    "stream error",
+    "temporary failure",
+    "the operation timed out",
+    "tls handshake timeout",
+    "unexpected eof",
+)
+
+
+def _is_transient_command_failure(result) -> bool:
+    details = f"{getattr(result, 'stdout', '')}\n{getattr(result, 'stderr', '')}".lower()
+    return any(marker in details for marker in _TRANSIENT_COMMAND_ERRORS)
+
+
+def wait_with_countdown(label: str, seconds: int, *, style: str = "yellow"):
+    if os.environ.get("AGENT_Z_QUIET_LIVE") == "1":
+        time.sleep(seconds)
+        return
+    started = time.monotonic()
+    stopped = threading.Event()
+    with console.status("", spinner="dots") as status:
+        def refresh():
+            while not stopped.is_set():
+                remaining = max(0, seconds - (time.monotonic() - started))
+                status.update(
+                    f"[bold {style}]{label}[/bold {style}] "
+                    f"[dim]| in:{format_duration(remaining)}[/dim]"
+                )
+                stopped.wait(0.25)
+
+        thread = threading.Thread(target=refresh, daemon=True)
+        thread.start()
+        try:
+            time.sleep(seconds)
+        finally:
+            stopped.set()
+            thread.join(timeout=1)
+
+
+def run_cmd(
+    cmd,
+    cwd=PROJECT_DIR,
+    check=True,
+    capture_output=True,
+    shell=False,
+    timeout=None,
+    verbose=False,
+    retry: bool | None = None,
+):
     if isinstance(cmd, str):
         cmd = [cmd]
-    if verbose:
-        log(f"[dim]{' '.join(cmd)}[/dim]")
-    result = subprocess.run(
-        cmd, cwd=cwd, shell=shell, capture_output=capture_output,
-        text=True, encoding="utf-8", check=False, timeout=timeout,
-    )
-    if verbose and capture_output:
+    retry_enabled = cmd[0] == "gh" if retry is None else retry
+    attempts = GITHUB_RETRY_ATTEMPTS if retry_enabled else 1
+    command_timeout = timeout
+    if retry_enabled and command_timeout is None:
+        command_timeout = GITHUB_COMMAND_TIMEOUT
+
+    result = None
+    for attempt in range(1, attempts + 1):
+        if verbose:
+            log(f"[dim]{' '.join(cmd)}[/dim]")
+        try:
+            result = subprocess.run(
+                cmd, cwd=cwd, shell=shell, capture_output=capture_output,
+                text=True, encoding="utf-8", errors="replace", check=False,
+                timeout=command_timeout,
+            )
+        except subprocess.TimeoutExpired:
+            if attempt >= attempts:
+                raise
+            result = None
+        else:
+            if result.returncode == 0 or not _is_transient_command_failure(result):
+                break
+            if attempt >= attempts:
+                break
+
+        delay = min(
+            GITHUB_RETRY_MAX_DELAY,
+            GITHUB_RETRY_BASE_DELAY * (2 ** (attempt - 1)),
+        )
+        wait_with_countdown(
+            f"Transient command failure; retrying {attempt + 1}/{attempts}",
+            delay,
+        )
+
+    if verbose and capture_output and result is not None:
         if result.stdout:
             print(result.stdout)
         if result.stderr:
             print(result.stderr, file=sys.stderr)
+    if result is None:
+        raise RuntimeError(f"cmd failed without a result: {' '.join(cmd)}")
     if check and result.returncode != 0:
         details = _short_output(result.stderr) or _short_output(result.stdout)
         suffix = f"\n{details}" if details else ""
@@ -105,10 +211,38 @@ def run_cmd(cmd, cwd=PROJECT_DIR, check=True, capture_output=True, shell=False, 
 
 
 @contextmanager
+def elapsed_status(label: str, *, style: str = "cyan", details=None):
+    if os.environ.get("AGENT_Z_QUIET_LIVE") == "1":
+        yield
+        return
+    started = time.monotonic()
+    stopped = threading.Event()
+    with console.status("", spinner="dots") as status:
+        def refresh():
+            while not stopped.is_set():
+                extra = details() if callable(details) else details
+                suffix = f" | {extra}" if extra else ""
+                status.update(
+                    f"[bold {style}]{label}[/bold {style}] [dim]| "
+                    f"elapsed:{format_duration(time.monotonic() - started)}"
+                    f"{suffix}[/dim]"
+                )
+                stopped.wait(1)
+
+        thread = threading.Thread(target=refresh, daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stopped.set()
+            thread.join(timeout=1)
+
+
+@contextmanager
 def agent_status(name: str, action: str):
     icon = AGENT_ICONS.get(name, "?")
     color = AGENT_COLORS.get(name, "white")
-    with console.status(f"[{color}]{icon} [{name}][/{color}] [dim]{action}...[/dim]", spinner="dots"):
+    with elapsed_status(f"{icon} [{name}] {action}", style=color):
         yield
 
 

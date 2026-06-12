@@ -22,6 +22,7 @@ class WorktreeManager:
             capture_output=True,
             text=True,
             encoding="utf-8",
+            errors="replace",
         ).returncode == 0
         command = ["git", "worktree", "add", str(path), branch]
         if not exists:
@@ -32,6 +33,7 @@ class WorktreeManager:
             capture_output=True,
             text=True,
             encoding="utf-8",
+            errors="replace",
         )
         if result.returncode != 0:
             details = (result.stderr or result.stdout).strip()
@@ -48,6 +50,7 @@ class WorktreeManager:
             capture_output=True,
             text=True,
             encoding="utf-8",
+            errors="replace",
         )
         if result.returncode != 0 or result.stdout.strip() != "true":
             raise RuntimeError(f"invalid worktree: {resolved}")
@@ -63,6 +66,7 @@ class WorktreeManager:
             capture_output=True,
             text=True,
             encoding="utf-8",
+            errors="replace",
         )
         if result.returncode != 0:
             details = (result.stderr or result.stdout).strip()

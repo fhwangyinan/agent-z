@@ -491,6 +491,81 @@ class RunStore:
             ).fetchall()
         return [self._record(row) for row in rows]
 
+    def active_issue_numbers(self, repo: str) -> set[int]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT issue_number FROM runs
+                WHERE repo = ?
+                  AND status IN ('queued', 'planning', 'ready', 'running', 'waiting_checks')
+                """,
+                (repo,),
+            ).fetchall()
+        return {int(row["issue_number"]) for row in rows}
+
+    def list_scheduler_queued(self, repo: str) -> list[RunRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT runs.* FROM runs
+                WHERE repo = ? AND status = 'queued'
+                  AND EXISTS (
+                    SELECT 1 FROM run_events
+                    WHERE run_events.run_id = runs.run_id
+                      AND run_events.event_type = 'scheduler_enqueued'
+                  )
+                ORDER BY created_at
+                """,
+                (repo,),
+            ).fetchall()
+        return [self._record(row) for row in rows]
+
+    def release_scheduler_queued(
+        self,
+        run_id: str,
+        *,
+        action: str,
+        reason: str,
+    ) -> bool:
+        if action not in {"defer", "reject"}:
+            raise ValueError(f"unsupported scheduler queue action: {action}")
+        status = "cancelled" if action == "defer" else "skipped"
+        event_type = "scheduler_queue_deferred" if action == "defer" else "scheduler_queue_rejected"
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                """
+                SELECT runs.* FROM runs
+                WHERE run_id = ? AND status = 'queued'
+                  AND EXISTS (
+                    SELECT 1 FROM run_events
+                    WHERE run_events.run_id = runs.run_id
+                      AND run_events.event_type = 'scheduler_enqueued'
+                  )
+                """,
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            connection.execute(
+                """
+                UPDATE runs
+                SET status = ?, stage = ?, error = ?, updated_at = ?
+                WHERE run_id = ? AND status = 'queued'
+                """,
+                (status, status, reason, _now(), run_id),
+            )
+            self._insert_event(
+                connection,
+                run_id=run_id,
+                event_type=event_type,
+                stage=status,
+                status=status,
+                message=reason,
+                data={"action": action, "previous_status": "queued"},
+            )
+        return True
+
     def find_completed_issue(
         self, repo: str, issue_number: int, *, exclude_run_id: str | None = None
     ) -> RunRecord | None:
