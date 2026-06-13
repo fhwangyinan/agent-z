@@ -80,12 +80,21 @@ class TuiFormattingTests(QuietRunTest):
     def test_record_age_formats_created_timestamp(self):
         record = SimpleNamespace(
             created_at="2026-01-01T00:00:00+00:00",
+            status="running",
         )
         created = orchestration.tui.datetime.fromisoformat("2026-01-01T00:00:00+00:00")
         now = orchestration.tui.datetime.fromisoformat("2026-01-01T01:02:03+00:00")
         with patch("orchestration.tui._parse_iso", return_value=created), patch("orchestration.tui.datetime") as dt:
             dt.now.return_value = now
             self.assertEqual(run._record_age(record), "1h 02m 03s")
+
+    def test_record_age_freezes_when_run_is_final(self):
+        record = SimpleNamespace(
+            created_at="2026-01-01T00:00:00+00:00",
+            updated_at="2026-01-01T00:03:04+00:00",
+            status="failed",
+        )
+        self.assertEqual(run._record_age(record), "3m 04s")
 
 
 class InteractiveImpactTests(QuietRunTest):

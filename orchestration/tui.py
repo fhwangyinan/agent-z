@@ -20,7 +20,7 @@ from rich.text import Text
 from agents import __version__
 from agents.base import format_duration, run_cmd, warn
 from config import GITHUB_REPO, MAX_PARALLEL_TASKS, REVIEWER_BACKEND, TASK_LEAD_BACKEND
-from orchestration.store import RunRecord, RunStore
+from orchestration.store import FINAL_STATUSES, RunRecord, RunStore
 from orchestration.runtime import runtime
 
 console = Console()
@@ -97,7 +97,13 @@ def _record_age(record: RunRecord) -> str:
     created = _parse_iso(getattr(record, "created_at", None))
     if created is None:
         return "-"
-    return format_duration((datetime.now(timezone.utc) - created).total_seconds())
+    if getattr(record, "status", None) in FINAL_STATUSES:
+        end = _parse_iso(getattr(record, "updated_at", None))
+        if end is None:
+            end = datetime.now(timezone.utc)
+    else:
+        end = datetime.now(timezone.utc)
+    return format_duration((end - created).total_seconds())
 
 def _status_text(status: str) -> str:
     status = _safe_text(status, "unknown")
