@@ -1,4 +1,5 @@
 import json
+import locale
 import os
 import time
 from datetime import datetime, timezone
@@ -7,7 +8,9 @@ from typing import Callable
 from rich import box
 from rich.align import Align
 from rich.console import Console
+from rich.layout import Layout
 from rich.live import Live
+from rich.markup import escape
 from rich.spinner import Spinner
 from rich.panel import Panel
 from rich.prompt import IntPrompt, Prompt
@@ -376,3 +379,189 @@ def show_run_detail(store: RunStore, run_id: str):
             details_text,
         )
     console.print(timeline)
+
+
+def _service_table(services, selected_service: int | None = None) -> Table:
+    table = Table(box=box.SIMPLE, expand=True, show_edge=False)
+    table.add_column("", width=2)
+    table.add_column("Process")
+    table.add_column("PID", justify="right")
+    table.add_column("State")
+    table.add_column("Restarts", justify="right")
+    for index, service in enumerate(services):
+        process = getattr(service, "process", None)
+        returncode = process.poll() if process is not None else None
+        alive = process is not None and returncode is None
+        if getattr(service, "circuit_open", False):
+            state = "[bold red]CIRCUIT OPEN[/bold red]"
+        else:
+            state = "[green]RUNNING[/green]" if alive else f"[red]EXIT {returncode}[/red]"
+        table.add_row(
+            ">" if selected_service == index else "",
+            str(getattr(service, "name", "unknown")),
+            str(getattr(process, "pid", "-")),
+            state,
+            str(getattr(service, "restarts", 0)),
+        )
+    return table
+
+
+def _dashboard_runs_table(records: list[RunRecord], selected: int) -> Table:
+    table = Table(box=box.SIMPLE, expand=True, show_edge=False)
+    table.add_column("", width=2)
+    table.add_column("Issue", width=8)
+    table.add_column("Status", width=16)
+    table.add_column("Stage", width=18)
+    table.add_column("Age", justify="right", width=10)
+    table.add_column("Result / Error", overflow="ellipsis")
+    for index, record in enumerate(records):
+        table.add_row(
+            ">" if index == selected else "",
+            f"#{record.issue_number}",
+            _status_text(record.status),
+            STAGE_LABELS.get(record.stage, record.stage),
+            _record_age(record),
+            record.pr_url or record.error or "",
+        )
+    if not records:
+        table.add_row("", "-", "[dim]NO RUNS[/dim]", "-", "-", "")
+    return table
+
+
+def _dashboard_run_detail(store: RunStore, record: RunRecord | None, expanded: bool):
+    if record is None:
+        return Panel("[dim]No task selected[/dim]", title="Task detail", border_style="dim")
+    lines = [
+        f"[bold cyan]{record.run_id}[/bold cyan]  |  Issue #{record.issue_number}",
+        f"{_status_text(record.status)}  |  {STAGE_LABELS.get(record.stage, record.stage)}",
+    ]
+    if record.pr_url:
+        lines.append(f"PR: {escape(record.pr_url)}")
+    if record.error:
+        lines.append(f"[red]{escape(record.error)}[/red]")
+    if expanded:
+        lines.extend([
+            f"[dim]Branch:[/dim] {record.branch or '-'}",
+            f"[dim]Lease:[/dim] {record.lease_role or '-'} / {record.lease_expires_at or '-'}",
+            f"[dim]Worktree:[/dim] {record.worktree_path or '-'}",
+        ])
+        events = store.list_events(record.run_id)[-8:]
+        if events:
+            lines.append("")
+            lines.append("[bold]Recent events[/bold]")
+            for event in events:
+                message = (event.message or "").replace("\n", " ")
+                lines.append(
+                    f"[dim]{escape(event.event_type)}[/dim] {escape(message[:160])}"
+                )
+    return Panel(
+        "\n".join(lines),
+        title=f"Task detail {'[expanded]' if expanded else '[collapsed]'}",
+        border_style="cyan",
+    )
+
+def _tail_service_log(service, *, expanded: bool) -> Panel:
+    log_path = getattr(service, "log_path", None)
+    lines = []
+    if log_path:
+        try:
+            with open(log_path, "rb") as handle:
+                handle.seek(0, 2)
+                size = handle.tell()
+                handle.seek(max(0, size - 65536))
+                data = handle.read()
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                text = data.decode(locale.getpreferredencoding(False), errors="replace")
+            lines = text.splitlines()[-(30 if expanded else 8):]
+        except OSError as exc:
+            lines = [f"Could not read log: {exc}"]
+    content = "\n".join(escape(line) for line in lines) or "[dim]No log output yet[/dim]"
+    return Panel(
+        content,
+        title=f"Process log {'[expanded]' if expanded else '[collapsed]'}",
+        border_style="blue",
+    )
+
+
+def render_service_dashboard(
+    store: RunStore,
+    services,
+    *,
+    selected: int = 0,
+    selected_run_id: str | None = None,
+    selected_service: int = 0,
+    focus: str = "tasks",
+    expanded: bool = False,
+    uptime: float = 0,
+    notices: list[str] | None = None,
+):
+    records = store.list(limit=20)
+    if selected_run_id:
+        for index, record in enumerate(records):
+            if record.run_id == selected_run_id:
+                selected = index
+                break
+    selected = max(0, min(selected, max(0, len(records) - 1)))
+    selected_service = max(0, min(selected_service, max(0, len(services) - 1)))
+    selected_record = records[selected] if records else None
+    selected_process = services[selected_service] if services else None
+    alive = sum(
+        1
+        for service in services
+        if getattr(service, "process", None) is not None
+        and service.process.poll() is None
+    )
+    header = Panel(
+        f"[bold cyan]Agent-Z Service[/bold cyan]  "
+        f"[dim]alive:{alive}/{len(services)} | uptime:{format_duration(uptime)}[/dim]\n"
+        "[dim]Tab switch pane  |  ↑/↓ or j/k select  |  Enter/Space expand  |  q stop[/dim]",
+        border_style="cyan",
+    )
+    service_panel = Panel(
+        _service_table(services, selected_service if focus == "processes" else None),
+        title=f"Processes {'[focused]' if focus == 'processes' else ''}",
+        border_style="bold blue" if focus == "processes" else "blue",
+    )
+    run_panel = Panel(
+        _dashboard_runs_table(records, selected if focus == "tasks" else -1),
+        title=f"Tasks {'[focused]' if focus == 'tasks' else ''}",
+        border_style="bold green" if focus == "tasks" else "green",
+    )
+    detail_panel = (
+        _tail_service_log(selected_process, expanded=expanded)
+        if focus == "processes" and selected_process is not None
+        else _dashboard_run_detail(store, selected_record, expanded)
+    )
+    global_events = [
+        event
+        for event in store.list_global_events(limit=20)
+        if not event.event_type.endswith("_idle")
+    ]
+    event_lines = [
+        f"{event.event_type}: {event.message or ''}".rstrip()
+        for event in global_events[-4:]
+    ]
+    notice_lines = [*(notices or []), *event_lines]
+    notice_text = (
+        "\n".join(escape(line) for line in notice_lines[-4:])
+        or "[dim]No recent service events[/dim]"
+    )
+    notice_panel = Panel(notice_text, title="Service events", border_style="yellow")
+
+    layout = Layout()
+    layout.split_column(
+        Layout(header, size=4),
+        Layout(name="main", ratio=1),
+        Layout(notice_panel, size=7),
+    )
+    layout["main"].split_row(
+        Layout(name="left", ratio=2),
+        Layout(detail_panel, ratio=3),
+    )
+    layout["main"]["left"].split_column(
+        Layout(service_panel, size=max(8, len(services) + 4)),
+        Layout(run_panel, ratio=1),
+    )
+    return layout, len(records)

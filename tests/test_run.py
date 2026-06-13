@@ -253,6 +253,15 @@ class WorkerPreflightTests(QuietRunTest):
         command = run_cmd.call_args.args[0]
         self.assertEqual(command[command.index("--state") + 1], "open")
 
+    @patch("orchestration.github_ops.run_cmd")
+    def test_related_pr_query_filters_partial_issue_number_matches(self, run_cmd):
+        run_cmd.return_value = result(stdout="""[
+            {"number": 1, "title": "Fix #123", "body": "", "url": "partial", "state": "OPEN"},
+            {"number": 2, "title": "Fix parser", "body": "Closes #12", "url": "exact", "state": "OPEN"}
+        ]""")
+        prs = orchestration.github_ops._get_related_open_prs(12)
+        self.assertEqual([pr["url"] for pr in prs], ["exact"])
+
     @patch("orchestration.github_ops._get_related_open_prs", return_value=[])
     @patch("orchestration.github_ops._get_issue_snapshot")
     def test_stale_plan_returns_issue_to_planner_queue(self, issue_snapshot, related_prs):
@@ -766,6 +775,131 @@ class WorkerTests(QuietRunTest):
         event_types = [call.args[1] for call in store.add_event.call_args_list]
         self.assertIn("worker_run_needs_human", event_types)
         self.assertNotIn("worker_run_failed", event_types)
+
+    @patch("orchestration.pools.WORKER_PREFLIGHT_MAX_RETRIES", 3)
+    @patch("orchestration.pools.execute_task", side_effect=RuntimeError("bad preflight"))
+    @patch("orchestration.pools._build_agents", return_value=(Mock(), Mock(), Mock(), Mock()))
+    @patch("orchestration.pools.WorktreeManager")
+    @patch("orchestration.pools.RunStore")
+    @patch("orchestration.pools.validate_environment")
+    def test_worker_quarantines_repeated_preflight_failure(
+        self,
+        validate_environment,
+        store_class,
+        worktree_class,
+        build_agents,
+        execute_task,
+    ):
+        record = SimpleNamespace(run_id="run-1", stage="ready", status="running")
+        store = Mock()
+        store.claim_ready.return_value = record
+        store.get.return_value = SimpleNamespace(
+            run_id="run-1",
+            stage="ready",
+            status="running",
+        )
+        store.count_events.return_value = 2
+        store_class.return_value = store
+
+        self.assertEqual(run.run_worker(max_runs=1, idle_sleep=1), 1)
+
+        store.update.assert_called_once_with(
+            "run-1",
+            status="needs_human",
+            stage="ready",
+            error="bad preflight",
+        )
+        event_types = [call.args[1] for call in store.add_event.call_args_list]
+        self.assertIn("worker_preflight_exhausted", event_types)
+
+    @patch("orchestration.pools.wait_with_status")
+    @patch("orchestration.pools.execute_task", side_effect=RuntimeError(
+        "file lock conflict with active run(s): other: module:src/parser"
+    ))
+    @patch("orchestration.pools._build_agents", return_value=(Mock(), Mock(), Mock(), Mock()))
+    @patch("orchestration.pools.WorktreeManager")
+    @patch("orchestration.pools.RunStore")
+    @patch("orchestration.pools.validate_environment")
+    def test_worker_defers_resource_conflict_without_consuming_retry_budget(
+        self,
+        validate_environment,
+        store_class,
+        worktree_class,
+        build_agents,
+        execute_task,
+        wait,
+    ):
+        record = SimpleNamespace(run_id="run-1", stage="ready", status="running")
+        store = Mock()
+        store.claim_ready.return_value = record
+        store.get.return_value = SimpleNamespace(
+            run_id="run-1", stage="ready", status="running",
+        )
+        store_class.return_value = store
+
+        self.assertEqual(run.run_worker(max_runs=1, idle_sleep=1), 1)
+
+        store.count_events.assert_not_called()
+        event_types = [call.args[1] for call in store.add_event.call_args_list]
+        self.assertIn("worker_resource_deferred", event_types)
+        self.assertNotIn("worker_preflight_retry", event_types)
+
+
+class PlannerTests(QuietRunTest):
+    @patch("orchestration.pools.PLANNER_RETRY_BASE_DELAY", 1)
+    @patch("orchestration.pools.wait_with_status")
+    @patch("orchestration.pools.plan_task", side_effect=RuntimeError("network timeout"))
+    @patch("orchestration.pools.RunStore")
+    @patch("orchestration.pools.validate_environment")
+    def test_planner_requeues_transient_failure(
+        self, validate_environment, store_class, plan_task, wait
+    ):
+        record = SimpleNamespace(run_id="run-1")
+        store = Mock()
+        store.claim_for_planning.return_value = record
+        store.count_events.return_value = 0
+        store_class.return_value = store
+
+        self.assertEqual(run.run_planner(max_runs=1, idle_sleep=1), 1)
+
+        plan_task.assert_called_once()
+        self.assertFalse(plan_task.call_args.kwargs["fail_on_error"])
+        store.update.assert_called_once_with(
+            "run-1",
+            status="queued",
+            stage="queued",
+            error="network timeout",
+            owner_pid=None,
+            lease_role=None,
+            lease_expires_at=None,
+        )
+        event_types = [call.args[1] for call in store.add_event.call_args_list]
+        self.assertIn("planner_retry", event_types)
+
+    @patch("orchestration.pools.error")
+    @patch("orchestration.pools.plan_task", side_effect=RuntimeError("invalid plan"))
+    @patch("orchestration.pools.RunStore")
+    @patch("orchestration.pools.validate_environment")
+    def test_planner_does_not_retry_deterministic_failure(
+        self, validate_environment, store_class, plan_task, error
+    ):
+        record = SimpleNamespace(run_id="run-1")
+        store = Mock()
+        store.claim_for_planning.return_value = record
+        store.count_events.return_value = 0
+        store_class.return_value = store
+
+        self.assertEqual(run.run_planner(max_runs=1, idle_sleep=1), 1)
+
+        store.update.assert_called_once_with(
+            "run-1",
+            status="failed",
+            stage="analyzing",
+            error="invalid plan",
+        )
+        event_types = [call.args[1] for call in store.add_event.call_args_list]
+        self.assertIn("planner_failed", event_types)
+        self.assertNotIn("planner_retry", event_types)
 
 
 class ReconcilerTests(QuietRunTest):
