@@ -1,4 +1,5 @@
 import unittest
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, patch
 
@@ -20,6 +21,7 @@ class SchedulerTests(unittest.TestCase):
         snapshot = {
             "candidate_state": candidates,
             "queue_state": {"10": "queued", "11": "queued"},
+            "agent_evaluated_at": datetime.now(timezone.utc).isoformat(),
         }
         self.assertIsNone(_agent_trigger(
             snapshot,
@@ -50,6 +52,33 @@ class SchedulerTests(unittest.TestCase):
                 policy_state={"version": 2},
             ),
             "policy_changed",
+        )
+
+    @patch("orchestration.scheduler.SCHEDULER_EMPTY_QUEUE_REEVALUATE_SECONDS", 1800)
+    def test_agent_trigger_periodically_reassesses_empty_queue(self):
+        candidates = {"1": {"updated_at": "same", "open_pr": False}}
+        recent = datetime.now(timezone.utc).isoformat()
+        stale = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        base = {
+            "candidate_state": candidates,
+            "queue_state": {},
+            "policy_state": _policy_state(),
+        }
+
+        self.assertIsNone(_agent_trigger(
+            {**base, "agent_evaluated_at": recent},
+            candidate_state=candidates,
+            queue_state={},
+            policy_state=_policy_state(),
+        ))
+        self.assertEqual(
+            _agent_trigger(
+                {**base, "agent_evaluated_at": stale},
+                candidate_state=candidates,
+                queue_state={},
+                policy_state=_policy_state(),
+            ),
+            "empty_queue_reassessment",
         )
 
     def test_extracts_explicit_dependencies(self):
@@ -276,6 +305,7 @@ class SchedulerTests(unittest.TestCase):
             "candidate_state": state,
             "queue_state": {},
             "policy_state": _policy_state(),
+            "agent_evaluated_at": datetime.now(timezone.utc).isoformat(),
             "updated_at": "earlier",
         }
         agent = Mock()

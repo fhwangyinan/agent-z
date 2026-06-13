@@ -70,6 +70,25 @@ class SchedulerAgentTests(unittest.TestCase):
         agent.rank([1])
         self.assertEqual(run.call_count, 2)
 
+    @patch("agents.scheduler.SchedulerAgent.run")
+    def test_malformed_decision_gets_one_same_session_correction(self, run):
+        run.side_effect = [
+            "I recommend issue #1.",
+            (
+                'SCHEDULER_JSON_START {"decisions": ['
+                '{"issue_number": 1, "action": "enqueue", "score": 80, '
+                '"reason": "Concrete task"}'
+                "]} SCHEDULER_JSON_END"
+            ),
+        ]
+
+        decisions = SchedulerAgent().rank([1])
+
+        self.assertEqual(decisions[0].action, "enqueue")
+        self.assertEqual(run.call_count, 2)
+        self.assertTrue(run.call_args.kwargs["resume_session"])
+        self.assertIn("could not be parsed", run.call_args.args[0])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -53,7 +53,26 @@ class SchedulerAgent(Agent):
             "score. Never introduce an issue number outside the candidate list."
         )
         output = self.run(prompt, timeout=TIMEOUT_ANALYST)
-        return parse_scheduler_decisions(output, set(issue_numbers))
+        try:
+            return parse_scheduler_decisions(output, set(issue_numbers))
+        except RuntimeError as exc:
+            correction = (
+                f"Your previous scheduler response could not be parsed: {exc}. "
+                "Return only the required structured decision object now. Include exactly one "
+                "decision for every candidate issue number: "
+                f"{', '.join(f'#{number}' for number in issue_numbers)}. "
+                "Do not omit candidates or add new issue numbers.\n\n"
+                "SCHEDULER_JSON_START\n"
+                '{"decisions":[{"issue_number":123,"action":"enqueue|defer|reject",'
+                '"score":0,"reason":"short reason"}]}\n'
+                "SCHEDULER_JSON_END"
+            )
+            output = self.run(
+                correction,
+                timeout=TIMEOUT_ANALYST,
+                resume_session=True,
+            )
+            return parse_scheduler_decisions(output, set(issue_numbers))
 
 
 def parse_scheduler_decisions(

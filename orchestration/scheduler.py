@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Callable
 
 from agents.base import log, run_cmd
@@ -12,6 +13,7 @@ from config import (
     SCHEDULER_AGENT_CANDIDATE_LIMIT,
     SCHEDULER_BATCH_SIZE,
     SCHEDULER_BLOCK_LABELS,
+    SCHEDULER_EMPTY_QUEUE_REEVALUATE_SECONDS,
     SCHEDULER_ELIGIBLE_LABELS,
     SCHEDULER_ISSUE_LIMIT,
     SCHEDULER_PRIORITY_LABELS,
@@ -230,6 +232,7 @@ def _policy_state() -> dict:
         "pr_limit": SCHEDULER_PR_LIMIT,
         "candidate_limit": SCHEDULER_AGENT_CANDIDATE_LIMIT,
         "batch_size": SCHEDULER_BATCH_SIZE,
+        "empty_queue_reevaluate_seconds": SCHEDULER_EMPTY_QUEUE_REEVALUATE_SECONDS,
     }
 
 
@@ -250,6 +253,18 @@ def _agent_trigger(
     current_queued = _queued_count(queue_state)
     if current_queued < SCHEDULER_BATCH_SIZE and current_queued < previous_queued:
         return "queue_needs_replenishment"
+    if current_queued == 0:
+        evaluated_at = snapshot.get("agent_evaluated_at")
+        if not evaluated_at:
+            return "empty_queue_reassessment"
+        try:
+            evaluated = datetime.fromisoformat(str(evaluated_at).replace("Z", "+00:00"))
+        except ValueError:
+            return "empty_queue_reassessment"
+        if (
+            datetime.now(timezone.utc) - evaluated
+        ).total_seconds() >= SCHEDULER_EMPTY_QUEUE_REEVALUATE_SECONDS:
+            return "empty_queue_reassessment"
     return None
 
 
@@ -436,5 +451,6 @@ def schedule_once(
         candidate_state=candidate_state,
         queue_state=store.scheduler_queue_state(GITHUB_REPO),
         policy_state=policy_state,
+        agent_evaluated=True,
     )
     return enqueued
