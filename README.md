@@ -1,45 +1,145 @@
+<div align="center">
+
 # Agent-Z
 
+<<<<<<< Updated upstream
 [中文文档](README.zh.md)
+=======
+### Turn GitHub issues into reviewed pull requests, continuously.
 
-Lightweight, backend-agnostic coding-agent automation for autonomous development loops.
+Agent-Z is an open-source control plane for coding agents. It discovers valuable
+work, plans it, runs isolated workers in parallel, reviews the changes, opens
+pull requests, watches CI, and recovers interrupted runs.
 
-Agent-Z combines a deterministic control plane with a flexible Task Lead, an independent Reviewer, scalable Workers, and a Reconciler, powered by Claude Code, Codex, or OpenCode.
+[![CI](https://github.com/fhwangyinan/agent-z/actions/workflows/ci.yml/badge.svg)](https://github.com/fhwangyinan/agent-z/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Claude Code](https://img.shields.io/badge/Claude_Code-supported-D97757)](https://docs.anthropic.com/en/docs/claude-code)
+[![Codex](https://img.shields.io/badge/Codex-supported-111111)](https://openai.com/codex/)
+[![OpenCode](https://img.shields.io/badge/OpenCode-supported-5C5CFF)](https://opencode.ai/)
+[![CodeRabbit](https://img.shields.io/badge/CodeRabbit-ready-FF570A)](https://coderabbit.ai/)
 
+[Quick Start](#quick-start) · [How It Works](#how-it-works) · [Architecture](#architecture) · [中文文档](README.zh.md)
+>>>>>>> Stashed changes
+
+</div>
+
+---
+
+## Why Agent-Z?
+
+Coding agents are good at solving a task. Running many of them safely across a
+real backlog is a different problem.
+
+Agent-Z provides the missing orchestration layer:
+
+| | Capability | What it means |
+|---|---|---|
+| **Agentic scheduling** | A Scheduler Agent evaluates and ranks real issues | Tracking issues, vague requests, active work, and low-value tasks stay out of the queue |
+| **Parallel execution** | Workers use isolated branches and Git worktrees | Independent issues can move at the same time without sharing a working tree |
+| **Conflict avoidance** | Issue, file, and module-level claims protect active work | Workers defer overlapping changes instead of racing each other |
+| **End-to-end delivery** | Plan, develop, review, submit, watch CI, fix, repeat | The unit of work is a reviewed pull request, not a code snippet |
+| **Durable recovery** | SQLite state, leases, heartbeats, retries, and reconciliation | Interrupted planning is requeued; abandoned development is surfaced for inspection |
+| **Backend freedom** | Claude Code, Codex, and OpenCode share one runner contract | Use one backend everywhere or mix a Task Lead with an independent Reviewer |
+
+## One Command, Full Pipeline
+
+```bash
+python run.py --serve
 ```
-Open Issues/PRs ← on-demand exploration ← Task Lead (select + plan + develop)
-                                         ↓
-Durable Queue → Worker Pool → Independent Reviewer → Deterministic Coordinator
-                     ↘              Reconciler              ↗
+
+This starts a Scheduler, Planner, Reconciler, and a configurable Worker pool.
+The full-screen TUI keeps processes, tasks, events, timings, and live log tails
+in one place.
+
+```text
+┌ Agent-Z Service ─────────────────────────────────────────────────────┐
+│ Processes          Tasks                  Selected task / live log   │
+│ ● scheduler        #123 planning          stage, lease, events       │
+│ ● planner          #118 developing        expandable log tail        │
+│ ● worker-1         #104 waiting_checks                               │
+│ ● reconciler                                                        │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-## Prerequisites
+Use `Tab` to switch panes, `j/k` or arrow keys to select, `Enter` or `Space` to
+expand, and `q` to stop the service. Child logs are preserved under
+`.agent-z/logs/`.
+
+## How It Works
+
+```mermaid
+flowchart LR
+    GH["GitHub Issues & PRs"] --> S["Scheduler Agent<br/>filter, assess, rank"]
+    S --> Q[("Durable SQLite Queue")]
+    Q --> P["Planner<br/>structured execution plan"]
+    P --> W["Worker Pool<br/>isolated worktrees"]
+    W --> R["Independent Reviewer"]
+    R --> C["Deterministic Coordinator"]
+    C --> PR["Pull Request + CI"]
+    PR -->|feedback| W
+    X["Reconciler"] -.-> Q
+    X -.-> W
+```
+
+1. **Discover**: cheap safety gates remove assigned, blocked, active, duplicate,
+   and dependency-blocked issues.
+2. **Prioritize**: the Scheduler Agent inspects candidate issue numbers on
+   GitHub, rejects non-deliverable work, and ranks expected value.
+3. **Plan**: the Task Lead creates a persisted, structured execution plan.
+4. **Isolate**: a Worker claims issue and module resources, then creates a
+   dedicated branch and worktree.
+5. **Build and review**: development continues in the Task Lead session; an
+   independent Reviewer sends findings back for fixes.
+6. **Deliver**: a deterministic Coordinator commits, pushes, opens the PR,
+   watches checks, and loops on actionable feedback.
+7. **Recover**: the Reconciler requeues expired planning leases and quarantines
+   abandoned development as `needs_human`.
+
+The Scheduler Agent is called only when the candidate snapshot changes or the
+queue needs replenishment. Open PRs are fetched once per scan, reducing API
+traffic and agent token use.
+
+## Quick Start
+
+### Requirements
 
 - Python 3.11+
-- [GitHub CLI](https://cli.github.com/) (`gh`) authenticated
-- At least one supported coding-agent CLI installed: `claude`, `codex`, or `opencode`
-- Optional: [CodeRabbitAI](https://coderabbit.ai/) GitHub App on target repo
+- Authenticated [GitHub CLI](https://cli.github.com/): `gh auth login`
+- At least one installed agent CLI: `claude`, `codex`, or `opencode`
+- Optional: the [CodeRabbit](https://coderabbit.ai/) GitHub App
 
-## Setup
+### Install
 
 ```bash
+git clone https://github.com/fhwangyinan/agent-z.git
+cd agent-z
+
 python -m venv .venv
-.venv\Scripts\activate      # Windows
-source .venv/bin/activate   # Linux/macOS
+source .venv/bin/activate       # Linux/macOS
+# .venv\Scripts\activate        # Windows PowerShell
+
 pip install -r requirements.txt
-cp .env.example .env        # edit with your settings
+cp .env.example .env
 ```
 
-## Usage
+Set the target project and repository in `.env`:
 
-For normal operation, only three commands are needed:
+```env
+PROJECT_DIR=/path/to/your/project
+GITHUB_REPO=owner/repository
+
+DEFAULT_BACKEND=claude
+# TASK_LEAD_BACKEND=claude
+# REVIEWER_BACKEND=codex
+```
+
+Then start the service:
 
 ```bash
-python run.py --serve              # recommended: start the complete autonomous service
-python run.py --list-runs          # list recent runs
-python run.py --inspect RUN_ID     # inspect one run and its event timeline
+python run.py --serve
 ```
 
+<<<<<<< Updated upstream
 `--serve` starts one Scheduler, one Planner, one Reconciler, and
 `SERVICE_WORKERS` Worker processes. Crashed child processes are restarted, and
 `Ctrl+C` stops the complete service. Use `--serve --workers 4` to override the
@@ -48,36 +148,58 @@ shows normal commands only; use `--help-all` for pool-level and tuning options.
 
 The remaining commands are intended for single-task operation, diagnostics, or
 independent scaling:
+=======
+## Designed for Real Repositories
+
+### Semantic scheduling, deterministic safety
+
+The Scheduler Agent decides which work is valuable; deterministic checks decide
+what is safe to consider. It skips assigned issues, active-work labels, related
+open PRs, and open dependencies declared as `Blocked by #123`, `Depends on
+#123`, or `Requires #123`.
+
+Candidate `updatedAt`, open-PR state, and queue state are persisted. Unchanged
+backlogs do not repeatedly invoke the Agent. New enqueue decisions fail closed
+when GitHub state is unavailable, while transient query failures do not cancel
+already queued work.
+
+### Parallel without pretending conflicts do not exist
+
+Every run gets a unique ID, branch, worktree, plan, workflow stage, and role
+lease. SQLite provides atomic queue claims and issue locks. Predicted files,
+actual changed files, and conservative module resources reduce collisions
+between parallel Workers.
+
+Agent-Z also rechecks GitHub immediately before development to avoid duplicating
+work started by another person or automation. For strict cross-machine
+mutual exclusion, pair Agent-Z with a repository-side lock or GitHub Action.
+
+### Failures are workflow states
+
+GitHub and network operations use bounded retries with exponential backoff.
+Planner failures can be retried, service subprocesses restart behind a circuit
+breaker, lease loss is propagated to the owning process, and structured events
+make unattended runs inspectable.
+
+## Everyday Commands
+>>>>>>> Stashed changes
 
 ```bash
-python run.py                       # interactive: confirm & Q&A each round
-python run.py --serve               # start the complete autonomous service
-python run.py --serve --workers 4   # start the service with four Workers
-python run.py --loop 5              # autonomous: 5 rounds, skip high-risk issues
-python run.py --loop 5 --force      # autonomous: develop all issues regardless of risk
-python run.py --issue 123           # run one unattended issue in an isolated worktree
-python run.py --enqueue 123         # add an issue to the persistent queue
-python run.py --plan-next           # plan the oldest queued issue once
-python run.py --run-next            # claim and run the oldest ready issue
-python run.py --resume RUN_ID       # resume from the persisted workflow stage
-python run.py --list-runs           # inspect recent and active runs
-python run.py --inspect RUN_ID      # show run metadata and structured events
-python run.py --cancel RUN_ID       # release locks and remove an abandoned worktree
-python run.py --worker              # continuously claim planned, ready tasks
-python run.py --planner             # continuously turn queued issues into execution plans
-python run.py --scheduler           # continuously discover and enqueue eligible issues
-python run.py --schedule-once       # run one scheduling scan
-python run.py --reconciler          # continuously recover expired leases
-python run.py --reconcile-once      # recover expired leases once
+python run.py --serve              # Start the complete autonomous service
+python run.py --serve --workers 4  # Start with four Workers
+python run.py --issue 123          # Run one issue unattended
+python run.py --enqueue 123        # Add an issue to the durable queue
+python run.py --list-runs          # List recent and active runs
+python run.py --inspect RUN_ID     # Show plan, state, and event timeline
+python run.py --resume RUN_ID      # Resume an interrupted run
+python run.py --cancel RUN_ID      # Cancel an abandoned run safely
+python run.py --help-all           # Show pool-level and tuning commands
 ```
 
-The scheduler uses deterministic checks only as safety gates, then asks a
-dedicated Scheduler Agent to semantically assess and rank the remaining issues.
-The Agent rejects tracking/meta issues, epics, roadmaps, discussions, vague
-requests, and other work that is not independently deliverable. It ranks
-actionable work by expected value, urgency, benefit breadth, confidence, cost,
-risk, and whether it unlocks other work. Labels are treated as hints.
+<details>
+<summary><strong>All operation modes</strong></summary>
 
+<<<<<<< Updated upstream
 GitHub remains the shared coordination source. Before Agent assessment, the
 scheduler skips assigned issues, active-work labels, related open PRs, and
 same-repository dependencies declared with `Blocked by #123`, `Depends on
@@ -164,40 +286,62 @@ Each round:
 8. **Review** — Independent local review; findings are explicitly handed back to Developer
 9. **Submit** — The Coordinator deterministically commits, pushes, opens, and verifies the PR
 10. **PR Checks** — Wait for all checks with `gh pr checks --watch` → Developer reads CI and review feedback → fixes → local Reviewer validates → push → repeat until no action is needed
+=======
+| Command | Purpose |
+|---|---|
+| `python run.py` | Interactive issue selection, impact Q&A, and development |
+| `python run.py --loop N` | Run N autonomous rounds |
+| `python run.py --loop N --force` | Include high-risk issues |
+| `python run.py --planner` | Continuously plan queued issues |
+| `python run.py --worker` | Continuously execute ready tasks |
+| `python run.py --scheduler` | Continuously discover and enqueue work |
+| `python run.py --schedule-once` | Run one scheduling scan |
+| `python run.py --reconciler` | Continuously recover expired leases |
+| `python run.py --reconcile-once` | Run one recovery scan |
+| `python run.py --plan-next` | Plan the oldest queued issue once |
+| `python run.py --run-next` | Execute the oldest ready task once |
+
+Planner and Worker processes can be scaled independently.
+
+</details>
+>>>>>>> Stashed changes
 
 ## Architecture
 
-```
-run.py                    Thin CLI entry point and compatibility exports
-config.py                 Configuration loaded from .env
+```text
+run.py                    CLI entry point
+config.py                 Environment-backed configuration
 orchestration/
-  store.py                SQLite queue, workflow state, issue and file locks
-  worktree.py             Isolated worktree lifecycle
-  runtime.py              Mutable CLI/runtime options
-  errors.py               Shared workflow exceptions
-  tui.py                  Rich terminal rendering and run inspection
-  github_ops.py           Git/GitHub queries, labels, preflight, and cleanup
-  submission.py           Commit metadata, push, PR creation, and PR adoption
+  scheduler.py            Safety filtering, snapshots, Agent scheduling
+  store.py                SQLite queue, state, leases, and resource claims
   workflow.py             Planning and task execution state machine
-  pools.py                Planner, Worker, and Reconciler process loops
+  service.py              Full-service supervisor and restart circuit breaker
+  tui.py                  Rich live dashboard and run inspection
+  github_ops.py           GitHub queries, preflight, retries, and cleanup
+  submission.py           Deterministic commit, push, PR creation, adoption
+  worktree.py             Isolated Git worktree lifecycle
+  pools.py                Scheduler, Planner, Worker, and Reconciler loops
 agents/
-  base.py                 Agent base class with pluggable runner
-  analyst.py              Task Lead issue selection, planning, impact assessment, Q&A
-  developer.py            Task Lead code fixes and review handling
-  reviewer.py             Local code review (diff + tests)
-  runners/
-    base.py               Backend contract, capabilities, and AgentResult
-    claude.py             Claude Code adapter with explicit session resume
-    codex.py              Codex CLI adapter with JSONL event parsing
-    opencode.py           OpenCode adapter with JSON event parsing
+  scheduler.py            Semantic issue assessment and ranking
+  analyst.py              Task Lead planning and impact analysis
+  developer.py            Implementation and review-feedback handling
+  reviewer.py             Independent local code review
+  runners/                Claude Code, Codex, and OpenCode adapters
 ```
 
-Planning and development share one persisted `task_lead` backend session. The Reviewer keeps an independent session, while the Coordinator performs deterministic lifecycle and GitHub operations.
+The Task Lead shares context across planning and development. The Reviewer uses
+an independent session. Lifecycle operations that must be predictable, such as
+claiming work, committing, pushing, and creating PRs, stay deterministic.
 
-Every persisted run has a unique ID, structured execution plan, workflow stage, and role lease. Any number of Planner and Worker processes can compete safely for their respective queues. SQLite performs atomic claims and Issue locks; predicted and actual changed-file claims stop overlapping active tasks. Reconciler processes requeue abandoned planning leases and quarantine abandoned development for human inspection.
+## Observability
 
-Before development, Agent-Z verifies that the required active-work label was actually applied. During submission, the Task Lead generates the commit message, PR title, and PR body from the final diff; the Coordinator validates that metadata, deterministically commits pending changes, pushes the run branch, calls `gh pr create`, and verifies the result through GitHub. Invalid Agent metadata falls back to safe templates. A pre-existing branch PR is explicitly recorded as externally adopted.
+- Full-screen process/task dashboard with stable selection and expandable logs
+- Live elapsed time for agent calls, waits, checks, and restarts
+- Structured SQLite event history for every run and global service events
+- Color-coded run list with status, stage, lease, age, PR, and errors
+- Rotating per-process logs under `.agent-z/logs/`
 
+<<<<<<< Updated upstream
 Completed and cancelled runs remove their owned active-work label and clean their worktree. Failed and `needs_human` runs keep the branch, label, and worktree by default for recovery; leases are still released. Set `CLEANUP_FAILED_WORKTREES=true` to remove failed worktrees while preserving the branch and active-work label.
 
 Routine discovery queries are open-only: issue selection lists open issues and open PRs, Worker preflight checks related open PRs, and submission recovery adopts only open PRs from the task branch. Closed and merged history is queried only by explicit item URL when a known PR must be inspected.
@@ -264,13 +408,60 @@ Use one backend for every role:
 
 ```env
 DEFAULT_BACKEND=codex
+=======
+```bash
+python run.py --list-runs
+python run.py --inspect RUN_ID
+>>>>>>> Stashed changes
 ```
 
-Or keep Task Lead context across planning and development while using an independent Reviewer:
+## CI and Automated Review
 
-```env
-TASK_LEAD_BACKEND=claude
-REVIEWER_BACKEND=codex
-```
+The included GitHub Actions workflow runs tests on Python 3.11, 3.12, and 3.13
+plus a compile check. Actions are pinned to immutable SHAs and use read-only
+repository permissions.
 
-Only selected backends are required at startup. If `opencode` is configured but not available on `PATH`, Agent-Z fails fast with a clear error.
+`.coderabbit.yaml` configures automated reviews focused on state transitions,
+SQLite atomicity, concurrency, recovery, external CLI calls, and test coverage.
+Install the CodeRabbit GitHub App to enable it; no repository secret is needed.
+
+<details>
+<summary><strong>Configuration reference</strong></summary>
+
+Copy `.env.example` to `.env`. The template documents every supported option.
+The most commonly tuned values are:
+
+| Variable | Purpose | Default |
+|---|---|---|
+| `PROJECT_DIR` | Target project path | required |
+| `GITHUB_REPO` | Target repository in `owner/repo` form | required |
+| `DEFAULT_BACKEND` | Default agent backend | `claude` |
+| `TASK_LEAD_BACKEND` | Planning and development backend | default backend |
+| `REVIEWER_BACKEND` | Independent review backend | default backend |
+| `MAX_PARALLEL_TASKS` | Maximum active tasks | `2` |
+| `SERVICE_WORKERS` | Workers started by `--serve` | max parallel tasks |
+| `SCHEDULER_BATCH_SIZE` | Maximum issues enqueued per scan | `10` |
+| `SCHEDULER_ELIGIBLE_LABELS` | Required scheduling labels; empty allows all | empty |
+| `SCHEDULER_BLOCK_LABELS` | Labels that block scheduling | `blocked` |
+| `SKIP_LABELS` | Active-work labels; first is applied before development | `ongoing` |
+| `GITHUB_RETRY_ATTEMPTS` | GitHub/Git network operation attempts | `3` |
+| `MAX_REVIEW_ROUNDS` | Maximum remote review-fix loops | `5` |
+
+See [`.env.example`](.env.example) for the complete list.
+
+</details>
+
+## Project Status
+
+Agent-Z is actively evolving. It is designed for repositories where agent CLIs
+are already trusted to edit code and where maintainers want a durable,
+observable workflow around them. Review the default backend flags and start with
+a constrained repository or eligible label before enabling broad scheduling.
+
+---
+
+<div align="center">
+
+Built for teams that want coding agents to finish the workflow, not just start it.
+
+</div>
