@@ -15,10 +15,11 @@ from config import (
     SCHEDULER_ELIGIBLE_LABELS,
     SCHEDULER_ISSUE_LIMIT,
     SCHEDULER_PRIORITY_LABELS,
+    SCHEDULER_PR_LIMIT,
     SCHEDULER_SKIP_ASSIGNED_ISSUES,
     SKIP_LABELS,
 )
-from orchestration.github_ops import _get_related_open_prs
+from orchestration.github_ops import extract_issue_references
 from orchestration.store import RunRecord, RunStore
 
 
@@ -27,6 +28,7 @@ DEPENDENCY_PATTERN = re.compile(
     r"((?:#\d+)(?:\s*(?:,|and)\s*#\d+)*)"
 )
 ISSUE_NUMBER_PATTERN = re.compile(r"#(\d+)")
+SCHEDULER_POLICY_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -38,6 +40,7 @@ class ScheduleCandidate:
     dependencies: tuple[int, ...]
     priority: int
     created_at: str
+    updated_at: str
 
 
 def extract_dependencies(body: str) -> tuple[int, ...]:
@@ -76,6 +79,7 @@ def select_schedulable_issues(
     priority_labels: list[str] | None = None,
     skip_assigned: bool = False,
     has_open_pr: Callable[[int], bool] | None = None,
+    candidate_state: dict[str, dict] | None = None,
     batch_size: int = SCHEDULER_BATCH_SIZE,
 ) -> list[ScheduleCandidate]:
     eligible = {label.lower() for label in (eligible_labels or [])}
@@ -100,7 +104,7 @@ def select_schedulable_issues(
         dependencies = extract_dependencies(str(issue.get("body") or ""))
         if any(dependency_is_open(number) for number in dependencies):
             continue
-        candidates.append(ScheduleCandidate(
+        candidate = ScheduleCandidate(
             issue_number=issue_number,
             title=str(issue.get("title") or "(untitled)"),
             body=str(issue.get("body") or ""),
@@ -108,17 +112,20 @@ def select_schedulable_issues(
             dependencies=dependencies,
             priority=_priority(labels, priorities),
             created_at=str(issue.get("createdAt") or ""),
-        ))
+            updated_at=str(issue.get("updatedAt") or ""),
+        )
+        open_pr = has_open_pr(candidate.issue_number) if has_open_pr is not None else False
+        if candidate_state is not None:
+            candidate_state[str(candidate.issue_number)] = {
+                "updated_at": candidate.updated_at,
+                "open_pr": bool(open_pr),
+            }
+        if open_pr:
+            continue
+        candidates.append(candidate)
 
     candidates.sort(key=lambda item: (item.priority, item.created_at, item.issue_number))
-    selected = []
-    for candidate in candidates:
-        if has_open_pr is not None and has_open_pr(candidate.issue_number):
-            continue
-        selected.append(candidate)
-        if len(selected) >= batch_size:
-            break
-    return selected
+    return candidates[:batch_size]
 
 
 def _list_open_issues() -> list[dict]:
@@ -128,7 +135,7 @@ def _list_open_issues() -> list[dict]:
             "--repo", GITHUB_REPO,
             "--state", "open",
             "--limit", str(SCHEDULER_ISSUE_LIMIT),
-            "--json", "number,title,body,labels,assignees,createdAt",
+            "--json", "number,title,body,labels,assignees,createdAt,updatedAt",
         ],
         check=False,
     )
@@ -162,10 +169,32 @@ def _issue_is_open(issue_number: int) -> bool:
         return True
 
 
-def _issue_has_open_pr(issue_number: int) -> bool:
-    prs = _get_related_open_prs(issue_number)
-    # A failed query is treated as occupied so the scheduler fails closed.
-    return prs is None or bool(prs)
+def _open_pr_issue_numbers() -> set[int] | None:
+    result = run_cmd(
+        [
+            "gh", "pr", "list",
+            "--repo", GITHUB_REPO,
+            "--state", "open",
+            "--limit", str(SCHEDULER_PR_LIMIT),
+            "--json", "title,body",
+        ],
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        prs = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(prs, list):
+        return None
+    return {
+        issue_number
+        for pr in prs
+        for issue_number in extract_issue_references(
+            f"{pr.get('title') or ''}\n{pr.get('body') or ''}"
+        )
+    }
 
 
 def _selected_by_agent(
@@ -185,6 +214,45 @@ def _selected_by_agent(
     return selected[:SCHEDULER_BATCH_SIZE], decisions
 
 
+def _queued_count(queue_state: dict[str, str]) -> int:
+    return sum(status == "queued" for status in queue_state.values())
+
+
+def _policy_state() -> dict:
+    return {
+        "version": SCHEDULER_POLICY_VERSION,
+        "eligible_labels": sorted(SCHEDULER_ELIGIBLE_LABELS),
+        "block_labels": sorted(SCHEDULER_BLOCK_LABELS),
+        "skip_labels": sorted(SKIP_LABELS),
+        "priority_labels": list(SCHEDULER_PRIORITY_LABELS),
+        "skip_assigned": SCHEDULER_SKIP_ASSIGNED_ISSUES,
+        "issue_limit": SCHEDULER_ISSUE_LIMIT,
+        "pr_limit": SCHEDULER_PR_LIMIT,
+        "candidate_limit": SCHEDULER_AGENT_CANDIDATE_LIMIT,
+        "batch_size": SCHEDULER_BATCH_SIZE,
+    }
+
+
+def _agent_trigger(
+    snapshot: dict | None,
+    *,
+    candidate_state: dict[str, dict],
+    queue_state: dict[str, str],
+    policy_state: dict | None = None,
+) -> str | None:
+    if snapshot is None:
+        return "initial_scan"
+    if policy_state is not None and snapshot.get("policy_state") != policy_state:
+        return "policy_changed"
+    if snapshot.get("candidate_state") != candidate_state:
+        return "candidate_state_changed"
+    previous_queued = _queued_count(snapshot.get("queue_state") or {})
+    current_queued = _queued_count(queue_state)
+    if current_queued < SCHEDULER_BATCH_SIZE and current_queued < previous_queued:
+        return "queue_needs_replenishment"
+    return None
+
+
 def schedule_once(
     store: RunStore,
     scheduler_agent: SchedulerAgent | None = None,
@@ -196,6 +264,8 @@ def schedule_once(
     }
     active_issue_numbers = store.active_issue_numbers(GITHUB_REPO)
     active_issue_numbers -= set(scheduler_queued)
+    open_pr_issue_numbers = _open_pr_issue_numbers()
+    candidate_state: dict[str, dict] = {}
     candidates = select_schedulable_issues(
         issues,
         active_issue_numbers=active_issue_numbers,
@@ -205,9 +275,65 @@ def schedule_once(
         skip_labels=SKIP_LABELS,
         priority_labels=SCHEDULER_PRIORITY_LABELS,
         skip_assigned=SCHEDULER_SKIP_ASSIGNED_ISSUES,
-        has_open_pr=_issue_has_open_pr,
+        # A failed bulk PR query fails closed for every candidate.
+        has_open_pr=lambda issue_number: (
+            open_pr_issue_numbers is None or issue_number in open_pr_issue_numbers
+        ),
+        candidate_state=candidate_state,
         batch_size=SCHEDULER_AGENT_CANDIDATE_LIMIT,
     )
+    fetched_issue_numbers = {int(issue["number"]) for issue in issues}
+    eligible_issue_numbers = {
+        int(number)
+        for number, state in candidate_state.items()
+        if open_pr_issue_numbers is None or not state.get("open_pr")
+    }
+    for issue_number, queued in scheduler_queued.items():
+        if (
+            issue_number in fetched_issue_numbers
+            and issue_number not in eligible_issue_numbers
+        ):
+            store.release_scheduler_queued(
+                queued.run_id,
+                action="defer",
+                reason="Scheduler safety filters no longer allow this issue",
+            )
+    queue_state = store.scheduler_queue_state(GITHUB_REPO)
+    snapshot = store.get_scheduler_snapshot(GITHUB_REPO)
+    policy_state = _policy_state()
+    trigger = _agent_trigger(
+        snapshot,
+        candidate_state=candidate_state,
+        queue_state=queue_state,
+        policy_state=policy_state,
+    )
+    if not candidates:
+        store.save_scheduler_snapshot(
+            GITHUB_REPO,
+            candidate_state=candidate_state,
+            queue_state=queue_state,
+            policy_state=policy_state,
+        )
+        return []
+    if trigger is None:
+        if snapshot.get("queue_state") != queue_state:
+            store.add_event(
+                None,
+                "scheduler_agent_skipped",
+                message="Scheduler Agent skipped because candidates are unchanged and queue supply is sufficient",
+                data={
+                    "candidate_issue_numbers": [candidate.issue_number for candidate in candidates],
+                    "queued": _queued_count(queue_state),
+                },
+            )
+        store.save_scheduler_snapshot(
+            GITHUB_REPO,
+            candidate_state=candidate_state,
+            queue_state=queue_state,
+            policy_state=policy_state,
+        )
+        return []
+
     scheduler_agent = scheduler_agent or SchedulerAgent()
     selected, decisions = _selected_by_agent(candidates, scheduler_agent)
     selected_numbers = {candidate.issue_number for candidate, _ in selected}
@@ -227,6 +353,7 @@ def schedule_once(
         data={
             "candidate_issue_numbers": [candidate.issue_number for candidate in candidates],
             "selected_issue_numbers": sorted(selected_numbers),
+            "trigger": trigger,
             "decisions": [
                 {
                     "issue_number": decision.issue_number,
@@ -239,9 +366,15 @@ def schedule_once(
         },
     )
     enqueued = []
+    available_slots = max(
+        0,
+        SCHEDULER_BATCH_SIZE - _queued_count(store.scheduler_queue_state(GITHUB_REPO)),
+    )
     for candidate, decision in selected:
         if candidate.issue_number in scheduler_queued:
             continue
+        if available_slots <= 0:
+            break
         try:
             record = store.enqueue(GITHUB_REPO, candidate.issue_number)
         except RuntimeError as exc:
@@ -264,4 +397,11 @@ def schedule_once(
             },
         )
         enqueued.append(record)
+        available_slots -= 1
+    store.save_scheduler_snapshot(
+        GITHUB_REPO,
+        candidate_state=candidate_state,
+        queue_state=store.scheduler_queue_state(GITHUB_REPO),
+        policy_state=policy_state,
+    )
     return enqueued

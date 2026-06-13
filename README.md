@@ -141,10 +141,31 @@ python run.py --serve
 
 <<<<<<< Updated upstream
 `--serve` starts one Scheduler, one Planner, one Reconciler, and
-`SERVICE_WORKERS` Worker processes. Crashed child processes are restarted, and
+`SERVICE_WORKERS` Worker processes. Crashed child processes use exponential
+restart backoff and open a circuit after repeated failures, and
 `Ctrl+C` stops the complete service. Use `--serve --workers 4` to override the
 Worker count and set that service's task concurrency to four. Default `--help`
 shows normal commands only; use `--help-all` for pool-level and tuning options.
+
+`--serve` uses a full-screen dashboard instead of streaming every child-process
+message into the terminal. It shows process health, recent tasks, selected
+details, and recent structured events. Use `Tab` to switch between Processes
+and Tasks, `Up/Down` or `j/k` to select, `Enter` or `Space` to expand task
+details or a live process log tail, and `q` to stop the service. Task selection
+stays stable when new runs arrive. Detailed child output is preserved in
+`.agent-z/logs/<process>.log`.
+
+### CI and CodeRabbit
+
+GitHub Actions runs the unit test suite on Python 3.11, 3.12, and 3.13, plus a
+separate compile check. The workflow uses read-only repository permissions and
+can be required in the `main` branch protection rules.
+
+The repository also includes `.coderabbit.yaml` for automatic Chinese-language
+reviews focused on workflow state, concurrency, recovery, external CLI calls,
+and test coverage. To enable reviews, install the CodeRabbit GitHub App for this
+repository at [coderabbit.ai](https://coderabbit.ai/). No repository secret is
+required for the standard GitHub App integration.
 
 The remaining commands are intended for single-task operation, diagnostics, or
 independent scaling:
@@ -205,10 +226,24 @@ scheduler skips assigned issues, active-work labels, related open PRs, and
 same-repository dependencies declared with `Blocked by #123`, `Depends on
 #123`, or `Requires #123`. The Scheduler Agent receives only the candidate issue
 numbers and inspects their current GitHub state itself. Agent decisions are
-fail-closed, recorded in the event log, and reconsidered on each scan.
+fail-closed and recorded in the event log.
+Open PRs are fetched once per Scheduler scan and mapped to exact Issue
+references instead of issuing one PR query per candidate.
+
+Each cheap Scheduler scan persists a repository snapshot containing candidate
+issue `updatedAt` values, related open-PR state, and queue statuses. The
+Scheduler Agent runs only on the first scan, when that candidate snapshot
+changes, or when queued work has been consumed and the queue needs
+replenishment. A replenishment fills only up to `SCHEDULER_BATCH_SIZE`; an
+unchanged underfilled queue is not repeatedly re-evaluated.
 Previously Scheduler-enqueued tasks that have not been claimed by a Planner are
 also re-evaluated, while manually enqueued and already claimed tasks are left
 untouched.
+
+Workers claim both predicted files and conservative module resources before
+development, reducing conflicts between parallel tasks that touch different
+files in the same module. Transient Planner failures are automatically retried
+with exponential backoff.
 
 `--cancel` refuses to remove a task that is still owned by a live Agent-Z process. Use it for queued, stopped, or abandoned runs.
 
@@ -228,7 +263,7 @@ The terminal output is designed to remain useful both interactively and in unatt
 - Every major stage displays the full Run ID, Issue number, status, stage, lease role, and cumulative elapsed time.
 - Agent calls report backend/session mode and execution time.
 - Worker, Planner, Scheduler, and Reconciler idle countdowns refresh in place instead of appending heartbeat lines.
-- `--serve` displays one live service health line; task, error, and restart events remain normal log lines.
+- `--serve` displays a full-screen selectable process/task dashboard with expandable live log tails; child output is written to `.agent-z/logs/`.
 - Agent calls show live elapsed time; PR check registration, check watching, and service restarts show dynamic timing status.
 - PR checks render as a result table with total wait time.
 - Completed, skipped, failed, interrupted, and `needs_human` runs render consistent terminal summaries.
@@ -383,14 +418,23 @@ Copy `.env.example` to `.env` and edit. Full options:
 | `MAX_PARALLEL_TASKS` | Maximum active tasks across processes | 2 |
 | `SERVICE_WORKERS` | Default Worker count for `--serve` | `MAX_PARALLEL_TASKS` |
 | `SERVICE_RESTART_DELAY` | Delay before restarting a crashed service child (s) | 5 |
+| `SERVICE_RESTART_MAX_DELAY` | Maximum exponential child restart delay (s) | 60 |
+| `SERVICE_RESTART_MAX_ATTEMPTS` | Consecutive restart attempts before opening the circuit | 5 |
+| `SERVICE_RESTART_RESET_SECONDS` | Healthy runtime required to reset restart failures (s) | 300 |
+| `SERVICE_LOG_MAX_BYTES` | Rotate each service child log after this many bytes | 5242880 |
+| `SERVICE_LOG_BACKUPS` | Number of rotated service logs to retain | 3 |
 | `MAX_RUN_SECONDS` | Per-attempt runtime budget | 21600 |
 | `CLEANUP_COMPLETED_WORKTREES` | Remove worktrees after successful completion | `true` |
 | `CLEANUP_FAILED_WORKTREES` | Remove failed/needs-human worktrees while preserving branch and label | `false` |
 | `WORKER_IDLE_SLEEP` | Queue worker sleep when no task is available | 30 |
+| `WORKER_PREFLIGHT_MAX_RETRIES` | Preflight failures before a task needs human attention | 3 |
 | `PLANNER_IDLE_SLEEP` | Planner sleep when no issue awaits analysis | 30 |
+| `PLANNER_MAX_RETRIES` | Maximum attempts for transient Planner failures | 3 |
+| `PLANNER_RETRY_BASE_DELAY` | Initial Planner retry delay (s) | 10 |
 | `SCHEDULER_IDLE_SLEEP` | Seconds between Scheduler scans | 60 |
 | `SCHEDULER_BATCH_SIZE` | Maximum Agent-approved issues enqueued per scan | 10 |
 | `SCHEDULER_ISSUE_LIMIT` | Maximum open issues fetched per scan | 100 |
+| `SCHEDULER_PR_LIMIT` | Maximum open PRs fetched once per scan | 500 |
 | `SCHEDULER_AGENT_CANDIDATE_LIMIT` | Maximum hard-filtered candidates assessed by the Scheduler Agent per scan | `SCHEDULER_ISSUE_LIMIT` |
 | `SCHEDULER_ELIGIBLE_LABELS` | Required scheduling labels; empty allows all open issues | — |
 | `SCHEDULER_BLOCK_LABELS` | Labels that prevent automatic scheduling | `blocked` |

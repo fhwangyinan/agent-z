@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -191,6 +192,16 @@ def _get_issue_snapshot(issue_number: int) -> dict | None:
     except json.JSONDecodeError:
         return None
 
+def extract_issue_references(text: str) -> set[int]:
+    matches = re.findall(
+        r"(?i)(?<!\d)#\s*(\d+)(?!\d)|\bissues?[\s/#:-]+(\d+)\b",
+        text or "",
+    )
+    return {
+        int(hash_reference or issue_reference)
+        for hash_reference, issue_reference in matches
+    }
+
 def _get_related_open_prs(issue_number: int) -> list[dict] | None:
     result = run_cmd(
         [
@@ -198,7 +209,7 @@ def _get_related_open_prs(issue_number: int) -> list[dict] | None:
             "--repo", GITHUB_REPO,
             "--state", "open",
             "--search", f"{issue_number} in:title,body",
-            "--json", "number,title,url,state",
+            "--json", "number,title,body,url,state",
         ],
         check=False,
     )
@@ -208,7 +219,15 @@ def _get_related_open_prs(issue_number: int) -> list[dict] | None:
         data = json.loads(result.stdout)
     except json.JSONDecodeError:
         return None
-    return data if isinstance(data, list) else None
+    if not isinstance(data, list):
+        return None
+    return [
+        pr
+        for pr in data
+        if issue_number in extract_issue_references(
+            f"{pr.get('title') or ''}\n{pr.get('body') or ''}"
+        )
+    ]
 
 def _base_sha() -> str:
     result = run_cmd(["git", "rev-parse", "origin/main"], check=False)

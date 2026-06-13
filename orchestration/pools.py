@@ -1,5 +1,7 @@
 import os
+import threading
 import time
+from contextlib import contextmanager
 
 from agents.analyst import AnalystAgent
 from agents.base import done, error, format_duration, log, warn
@@ -8,11 +10,14 @@ from config import (
     MAX_PARALLEL_TASKS,
     PLANNER_IDLE_SLEEP,
     PLANNER_LEASE_SECONDS,
+    PLANNER_MAX_RETRIES,
+    PLANNER_RETRY_BASE_DELAY,
     RECONCILER_INTERVAL,
     SCHEDULER_IDLE_SLEEP,
     STATE_DB,
     WORKER_IDLE_SLEEP,
     WORKER_LEASE_SECONDS,
+    WORKER_PREFLIGHT_MAX_RETRIES,
     WORKTREE_ROOT,
     PROJECT_DIR,
 )
@@ -23,6 +28,72 @@ from orchestration.store import RunStore
 from orchestration.tui import show_banner, show_pool_status, wait_with_status
 from orchestration.workflow import _build_agents, execute_task, plan_task
 from orchestration.worktree import WorktreeManager
+
+TRANSIENT_ERROR_MARKERS = (
+    "timeout",
+    "timed out",
+    "connection",
+    "network",
+    "unreachable",
+    "refused",
+    "reset",
+    "broken pipe",
+    "temporary failure",
+    "temporarily unavailable",
+    "rate limit",
+    "too many requests",
+    "eof",
+)
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in TRANSIENT_ERROR_MARKERS)
+
+
+@contextmanager
+def maintain_lease(
+    store: RunStore,
+    run_id: str,
+    role: str,
+    lease_seconds: int,
+    *,
+    interval: float | None = None,
+):
+    stop = threading.Event()
+    heartbeat_errors: list[RuntimeError] = []
+    refresh_interval = interval or max(1.0, min(30.0, lease_seconds / 3))
+
+    def refresh():
+        while not stop.wait(refresh_interval):
+            try:
+                store.heartbeat(run_id, role, lease_seconds)
+            except RuntimeError as exc:
+                heartbeat_errors.append(exc)
+                stop.set()
+                return
+            except Exception as exc:
+                store.add_event(
+                    run_id,
+                    "lease_heartbeat_failed",
+                    message=str(exc),
+                    data={"role": role, "lease_seconds": lease_seconds},
+                )
+
+    thread = threading.Thread(
+        target=refresh,
+        name=f"{role}-lease-{run_id}",
+        daemon=True,
+    )
+    thread.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        thread.join(timeout=max(1.0, refresh_interval + 1))
+    if heartbeat_errors:
+        raise heartbeat_errors[0]
+
 
 def cancel_run(store: RunStore, worktrees: WorktreeManager, run_id: str):
     record = store.cancel(run_id)
@@ -86,7 +157,12 @@ def run_worker(*, max_runs: int = 0, idle_sleep: int = WORKER_IDLE_SLEEP) -> int
         )
         analyst, developer, reviewer, submitter = _build_agents()
         try:
-            execute_task(record, store, worktrees, analyst, developer, reviewer, submitter)
+            with maintain_lease(
+                store, record.run_id, "worker", WORKER_LEASE_SECONDS
+            ):
+                execute_task(
+                    record, store, worktrees, analyst, developer, reviewer, submitter
+                )
             store.add_event(
                 record.run_id,
                 "worker_run_finished",
@@ -105,12 +181,8 @@ def run_worker(*, max_runs: int = 0, idle_sleep: int = WORKER_IDLE_SLEEP) -> int
             current = store.get(record.run_id)
             event_type = "worker_run_failed"
             error_msg = str(exc)
-            is_network_err = any(
-                p in error_msg.lower()
-                for p in ("eof", "timeout", "connection", "network", "unreachable", "refused", "reset", "broken pipe", "temporary failure")
-            )
-            if current.status == "needs_human" and is_network_err and current.stage == "ready":
-                # Transient network issue during preflight/labeling; requeue to retry.
+            is_network_err = _is_transient_error(exc)
+            if current.stage == "ready" and "file lock conflict" in error_msg.lower():
                 store.update(
                     record.run_id,
                     status="ready",
@@ -122,58 +194,98 @@ def run_worker(*, max_runs: int = 0, idle_sleep: int = WORKER_IDLE_SLEEP) -> int
                 )
                 store.add_event(
                     record.run_id,
-                    "worker_preflight_retry",
+                    "worker_resource_deferred",
                     stage="ready",
                     status="ready",
                     message=error_msg,
                     data={"claimed": claimed},
                 )
                 warn(
-                    f"Run {record.run_id} preflight failed due to network issue, requeued to ready: {exc}; "
-                    "worker will retry later"
+                    f"Run {record.run_id} conflicts with active resources; "
+                    "moved behind other ready work"
                 )
-                continue
-            if current.status == "needs_human":
+                wait_with_status(
+                    "Worker",
+                    f"resource conflict backoff | run:{record.run_id}",
+                    idle_sleep,
+                    style="yellow",
+                )
+            elif current.stage == "ready":
+                retry_count = store.count_events(
+                    record.run_id, "worker_preflight_retry"
+                ) + 1
+                if retry_count >= WORKER_PREFLIGHT_MAX_RETRIES:
+                    store.update(
+                        record.run_id,
+                        status="needs_human",
+                        stage="ready",
+                        error=error_msg,
+                    )
+                    store.add_event(
+                        record.run_id,
+                        "worker_preflight_exhausted",
+                        stage="ready",
+                        status="needs_human",
+                        message=error_msg,
+                        data={
+                            "attempt": retry_count,
+                            "max_retries": WORKER_PREFLIGHT_MAX_RETRIES,
+                        },
+                    )
+                    warn(
+                        f"Run {record.run_id} preflight failed {retry_count} times; "
+                        "marked needs_human"
+                    )
+                else:
+                    # Release the lease and retry after a bounded backoff.
+                    store.update(
+                        record.run_id,
+                        status="ready",
+                        stage="ready",
+                        error=error_msg,
+                        owner_pid=None,
+                        lease_role=None,
+                        lease_expires_at=None,
+                    )
+                    store.add_event(
+                        record.run_id,
+                        "worker_preflight_retry",
+                        stage="ready",
+                        status="ready",
+                        message=error_msg,
+                        data={
+                            "attempt": retry_count,
+                            "max_retries": WORKER_PREFLIGHT_MAX_RETRIES,
+                            "network_error": is_network_err,
+                        },
+                    )
+                    warn(
+                        f"Run {record.run_id} preflight failed, retry "
+                        f"{retry_count}/{WORKER_PREFLIGHT_MAX_RETRIES}: {exc}"
+                    )
+                    wait_with_status(
+                        "Worker",
+                        f"preflight retry backoff | run:{record.run_id}",
+                        idle_sleep,
+                        style="yellow",
+                    )
+            elif current.status == "needs_human":
                 event_type = "worker_run_needs_human"
                 warn(
                     f"Run {record.run_id} needs human attention: {exc}; "
                     "worker will continue with other ready tasks"
                 )
-            elif current.stage == "ready":
-                # Preflight failed (likely transient network issue);
-                # release the lease so the run can be retried later.
-                store.update(
-                    record.run_id,
-                    status="ready",
-                    stage="ready",
-                    error=error_msg,
-                    owner_pid=None,
-                    lease_role=None,
-                    lease_expires_at=None,
-                )
+            else:
+                error(str(exc))
+            if current.stage != "ready":
                 store.add_event(
                     record.run_id,
-                    "worker_preflight_retry",
-                    stage="ready",
-                    status="ready",
+                    event_type,
+                    stage=current.stage,
+                    status=current.status,
                     message=error_msg,
                     data={"claimed": claimed},
                 )
-                warn(
-                    f"Run {record.run_id} preflight failed, requeued to ready: {exc}; "
-                    "worker will retry later"
-                )
-                continue
-            else:
-                error(str(exc))
-            store.add_event(
-                record.run_id,
-                event_type,
-                stage=current.stage,
-                status=current.status,
-                message=error_msg,
-                data={"claimed": claimed},
-            )
 
         if max_runs and claimed >= max_runs:
             show_pool_status(
@@ -219,11 +331,67 @@ def run_planner(*, max_runs: int = 0, idle_sleep: int = PLANNER_IDLE_SLEEP) -> i
             continue
         claimed += 1
         try:
-            plan_task(record, store, AnalystAgent())
+            with maintain_lease(
+                store, record.run_id, "planner", PLANNER_LEASE_SECONDS
+            ):
+                plan_task(record, store, AnalystAgent(), fail_on_error=False)
         except KeyboardInterrupt:
             raise
         except Exception as exc:
-            error(str(exc))
+            retry_count = store.count_events(record.run_id, "planner_retry") + 1
+            if _is_transient_error(exc) and retry_count < PLANNER_MAX_RETRIES:
+                delay = PLANNER_RETRY_BASE_DELAY * (2 ** (retry_count - 1))
+                store.update(
+                    record.run_id,
+                    status="queued",
+                    stage="queued",
+                    error=str(exc),
+                    owner_pid=None,
+                    lease_role=None,
+                    lease_expires_at=None,
+                )
+                store.add_event(
+                    record.run_id,
+                    "planner_retry",
+                    stage="queued",
+                    status="queued",
+                    message=str(exc),
+                    data={
+                        "attempt": retry_count,
+                        "max_retries": PLANNER_MAX_RETRIES,
+                        "delay": delay,
+                    },
+                )
+                warn(
+                    f"Planning run {record.run_id} hit a transient failure; "
+                    f"retry {retry_count}/{PLANNER_MAX_RETRIES} in {delay}s"
+                )
+                wait_with_status(
+                    "Planner",
+                    f"retry backoff | run:{record.run_id}",
+                    delay,
+                    style="yellow",
+                )
+            else:
+                store.update(
+                    record.run_id,
+                    status="failed",
+                    stage="analyzing",
+                    error=str(exc),
+                )
+                store.add_event(
+                    record.run_id,
+                    "planner_failed",
+                    stage="analyzing",
+                    status="failed",
+                    message=str(exc),
+                    data={
+                        "transient": _is_transient_error(exc),
+                        "attempt": retry_count,
+                        "max_retries": PLANNER_MAX_RETRIES,
+                    },
+                )
+                error(str(exc))
         if max_runs and claimed >= max_runs:
             store.add_event(None, "planner_stopped", data={"claimed": claimed})
             show_pool_status(
