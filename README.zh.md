@@ -2,9 +2,6 @@
 
 # Agent-Z
 
-<<<<<<< Updated upstream
-[English](README.md)
-=======
 ### 持续把 GitHub Issue 变成经过审查的 Pull Request。
 
 Agent-Z 是面向 coding agent 的开源控制平面：自动发现高价值任务、生成计划、
@@ -18,7 +15,6 @@ Agent-Z 是面向 coding agent 的开源控制平面：自动发现高价值任�
 [![CodeRabbit](https://img.shields.io/badge/CodeRabbit-ready-FF570A)](https://coderabbit.ai/)
 
 [快速开始](#快速开始) · [工作原理](#工作原理) · [架构](#架构) · [English](README.md)
->>>>>>> Stashed changes
 
 </div>
 
@@ -129,15 +125,6 @@ DEFAULT_BACKEND=claude
 python run.py --serve
 ```
 
-<<<<<<< Updated upstream
-`--serve` 会启动一个 Scheduler、一个 Planner、一个 Reconciler，以及默认
-`SERVICE_WORKERS` 个 Worker。任一子进程异常退出后会自动重启；按 `Ctrl+C`
-统一停止全部进程。可用 `python run.py --serve --workers 4` 临时覆盖 Worker 数量，
-并将本次服务的最大并发任务数设为 4。
-默认 `--help` 只展示日常命令；使用 `python run.py --help-all` 查看池级和调参命令。
-
-以下命令用于单任务处理、调试或独立扩缩：
-=======
 ## 为真实仓库而设计
 
 ### Agent 决定价值，确定性逻辑保证安全
@@ -166,7 +153,6 @@ GitHub 与网络操作采用有界指数退避重试；Planner 瞬时失败可�
 事件，便于诊断无人值守任务。
 
 ## 日常命令
->>>>>>> Stashed changes
 
 ```bash
 python run.py --serve              # 启动完整自治服务
@@ -199,77 +185,7 @@ python run.py --help-all           # 查看池级与调参命令
 
 Planner 与 Worker 进程可以独立扩缩。
 
-<<<<<<< Updated upstream
-### TUI 可观测性
-
-终端输出同时适合交互观察和无人值守日志留存：
-
-- 每个关键阶段展示完整 Run ID、Issue 编号、状态、阶段、租约角色和累计耗时。
-- Agent 调用展示后端/session 模式与执行耗时。
-- Worker、Planner、Scheduler、Reconciler 的空闲倒计时和运行时间在同一行实时刷新，不持续堆积 heartbeat 日志。
-- `--serve` 统一显示一条服务存活进程数与运行时间状态；任务、错误和重启事件仍保留为正常日志行。
-- Agent 调用会实时显示已运行时间；PR checks 注册等待、检查等待和服务重启会显示动态时间状态。
-- PR Checks 使用结果表展示，并包含总等待时间。
-- 完成、跳过、失败、中断和 `needs_human` 使用统一终态摘要。
-- `--list-runs` 展示带颜色的状态总览、任务年龄、租约、PR 和错误。
-- `--inspect RUN_ID` 展示运行详情、持久化计划和带相对时间的事件时间线。
-
-### 交互模式
-
-- 让 Agent 自动推荐 issue，或手动指定编号
-- 查看影响评估，与 Analyst 追问讨论
-- 输入 `skip` 换 issue，`done` 或回车开始开发
-
-### 自主模式
-
-- Agent 自动推荐并修复 issue，无人值守
-- 风险评估：**high / very_high** 跳过（加 `--force` 则忽略）
-- 可用参数：
-
-| 参数 | 效果 |
-|------|------|
-| `--serve` | 启动 Scheduler、Planner、Worker 与 Reconciler 完整服务 |
-| `--workers N` | 设置 `--serve` 启动的 Worker 数量 |
-| `--loop N` | 自动运行 N 轮 |
-| `--force` | 忽略风险级别，全部开发 |
-| `--issue N` | 立即执行一个 Issue |
-| `--enqueue N` | 将 Issue 加入 SQLite 队列 |
-| `--plan-next` | 单次规划最早的排队 Issue |
-| `--run-next` | 有空闲并发槽时领取最早的已规划 ready 任务 |
-| `--resume RUN_ID` | 恢复失败或中断的任务 |
-| `--inspect RUN_ID` | 查看持久化元数据和结构化事件时间线 |
-| `--planner` | 启动一个可独立扩缩的 Planner 进程 |
-| `--scheduler` | 持续扫描并按优先级入队无阻塞 Issue |
-| `--schedule-once` | 执行一次调度扫描 |
-| `--worker` | 启动一个可独立扩缩的开发 Worker |
-| `--reconciler` | 持续恢复过期 Planner/Worker 租约 |
-| `--reconcile-once` | 执行一次过期租约恢复 |
-| `--worker-max-runs N` | worker 领取 N 个任务后停止（`0` 表示持续运行） |
-| `--keep-worktree` | 成功后保留任务 worktree |
-
-## 工作流
-
-每轮执行：
-
-1. **Issue 调度与入队** — Scheduler 先用确定性规则跳过已有 assignee、活动标签、相关 open PR 或未关闭依赖的 Issue，再只把候选 Issue 编号交给专职 Scheduler Agent，由 Agent 自行通过 `gh` 查看最新正文、标签、引用、相关 PR 和代码，判断候选是否是可独立交付的代码任务，并按预期收益、紧迫度、影响面、置信度、成本、风险和解锁价值排序。Tracking/meta issue、epic、roadmap、讨论、模糊请求等会被拒绝；标签只作为提示。Issue 正文可用 `Blocked by #123`、`Depends on #123` 或 `Requires #123` 声明依赖；互不依赖的高价值 Issue 会批量入队并可并行执行。Agent 输出异常时本轮不会入队，决策会写入事件日志并在每轮重新判断。旧版 Scheduler 已入队但尚未被 Planner 领取的任务也会重新审查；手动入队和已领取任务不会被自动取消。
-2. **Task Lead 规划** — 按需探索相关 open Issue/PR，分析 Issue、评估影响、把可读结论写入 Issue，并持久化版本化结构执行计划：
-   - `very_low` — 无影响
-   - `low` — 轻微影响
-   - `medium` — 中等影响
-   - `high` — 显著影响（行为/API 变化）→ 自动跳过
-   - `very_high` — 破坏性变更（改变流程/输出）→ 自动跳过
-   - 已有评估则追加更新，不重复创建
-3. **交互问答**（仅交互模式）— 就影响评估与 Analyst 对话；`skip` 换 issue
-4. **Worker Preflight** — 开工前重新检查 Issue 状态、label、相关 PR、计划新鲜度和预测文件冲突。
-5. **标记已认领** — 开发开始前给 Issue 添加 `SKIP_LABELS` 中的第一个标签
-6. **任务隔离** — 为每个任务创建独立分支和 Git worktree
-7. **开发修复** — 在同一个 Task Lead session 中继续，并在独立 worktree 中修复代码
-8. **本地审查** — 独立 Reviewer 审查；发现的问题显式交给 Developer 修复
-9. **提交 PR** — Coordinator 确定性地 commit、push、创建并验证 PR
-10. **PR Checks** — 使用 `gh pr checks --watch` 等待全部 checks → Developer 读取 CI 与 review 反馈 → 修复 → 本地 Reviewer 复查通过 → push → 循环直到无需修改
-=======
 </details>
->>>>>>> Stashed changes
 
 ## 架构
 
@@ -305,80 +221,9 @@ commit、push、创建 PR 等必须可预测的生命周期操作保持确定性
 - 带状态、阶段、租约、年龄、PR 和错误的彩色任务列表
 - `.agent-z/logs/` 下按进程保存并轮转日志
 
-<<<<<<< Updated upstream
-开发前，Agent-Z 会确认必需的进行中 label 已真正添加。提交阶段由 Task Lead 根据最终 diff 生成 commit message、PR 标题和 PR 描述；Coordinator 校验这些元数据后，确定性地提交残留改动、推送任务分支、调用 `gh pr create`，并通过 GitHub 验证结果。Agent 元数据无效时会使用安全模板兜底。分支上预先存在的 PR 会明确记录为“接管外部 PR”。
-
-完成和取消的任务会移除本任务添加的 active-work label，并清理 worktree。失败和 `needs_human` 任务默认保留分支、label 和 worktree 以便恢复，但仍会释放租约。设置 `CLEANUP_FAILED_WORKTREES=true` 可清理失败 worktree，同时保留分支和 active-work label。
-
-日常发现查询只读取 open 数据：选题只列出 open Issue 和 open PR，Worker preflight 只检查相关 open PR，提交恢复也只接管任务分支上的 open PR。只有已经持有明确 PR URL、确需检查该对象时，才会查询单个历史 PR。
-
-Task Lead 只在需要时通过有针对性、可分页的查询探索 open Issue 和 open PR。Coordinator 不再把 backlog 快照注入 prompt，因此既保留探索灵活性，也避免反复加载仓库全局状态。
-
-结构化事件会写入 SQLite，覆盖队列、worker、阶段、状态、恢复、取消、跳过标签和文件声明等变化。远程或无人值守任务需要诊断时，可用 `python run.py --inspect RUN_ID` 查看时间线。
-
-## 配置
-
-复制 `.env.example` 为 `.env` 后修改。全部选项：
-
-| 变量 | 说明 | 默认值 |
-|------|------|--------|
-| `PROJECT_DIR` | 目标项目路径 | — |
-| `GITHUB_REPO` | 目标仓库 (owner/repo) | — |
-| `SKIP_LABELS` | 逗号分隔的跳过标签；开发前会添加第一个标签 | `ongoing` |
-| `AGENT_Z_HOME` | 运行状态目录 | `.agent-z` |
-| `STATE_DB` | SQLite 状态数据库 | `.agent-z/state.db` |
-| `WORKTREE_ROOT` | 独立 worktree 目录 | `.agent-z/worktrees` |
-| `DEFAULT_BACKEND` | 默认后端：`claude`、`codex` 或 `opencode` | `claude` |
-| `TASK_LEAD_BACKEND` | Issue 选择、规划和开发共享的后端 | `ANALYST_BACKEND` 或 `DEFAULT_BACKEND` |
-| `REVIEWER_BACKEND` | Reviewer 后端覆盖 | `DEFAULT_BACKEND` |
-| `CLAUDE_FLAGS` | Claude 参数 | `--dangerously-skip-permissions` |
-| `CODEX_FLAGS` | Codex 参数 | `--dangerously-bypass-approvals-and-sandbox` |
-| `OPENCODE_FLAGS` | OpenCode 参数 | — |
-| `TIMEOUT_ANALYST` | Analyst 超时 (秒) | 3600 |
-| `TIMEOUT_DEVELOPER` | Developer 超时 (秒) | 10800 |
-| `TIMEOUT_REVIEWER` | Reviewer 超时 (秒) | 1800 |
-| `RETRY_TIMEOUT` | 重试超时 (秒) | 3600 |
-| `GITHUB_RETRY_ATTEMPTS` | GitHub CLI 与显式网络 Git 操作的最大尝试次数 | 3 |
-| `GITHUB_RETRY_BASE_DELAY` | 瞬时网络失败首次重试等待秒数 | 2 |
-| `GITHUB_RETRY_MAX_DELAY` | 指数退避最大等待秒数 | 30 |
-| `GITHUB_COMMAND_TIMEOUT` | 未显式设置 timeout 的单次 GitHub/Git 网络命令超时秒数 | 60 |
-| `PR_CHECKS_INTERVAL` | PR Checks watch 间隔 (秒) | 10 |
-| `PR_CHECKS_MAX_WAIT` | PR Checks 最大等待 (秒) | 900 |
-| `MAX_REVIEW_ROUNDS` | Review 最大轮次 | 5 |
-| `MAX_LOCAL_REVIEW_ROUNDS` | 本地 Review 最大轮次 | 5 |
-| `MAX_PARALLEL_TASKS` | 跨进程最大活跃任务数 | 2 |
-| `SERVICE_WORKERS` | `--serve` 默认启动的 Worker 数量 | `MAX_PARALLEL_TASKS` |
-| `SERVICE_RESTART_DELAY` | 服务子进程异常退出后的重启等待秒数 | 5 |
-| `MAX_RUN_SECONDS` | 单次执行时间预算 | 21600 |
-| `CLEANUP_COMPLETED_WORKTREES` | 成功后删除 worktree | `true` |
-| `CLEANUP_FAILED_WORKTREES` | 失败/needs-human 后删除 worktree，但保留分支与 label | `false` |
-| `WORKER_IDLE_SLEEP` | 队列 worker 空闲时的 sleep 秒数 | 30 |
-| `PLANNER_IDLE_SLEEP` | Planner 无待分析 Issue 时的 sleep 秒数 | 30 |
-| `SCHEDULER_IDLE_SLEEP` | Scheduler 扫描间隔秒数 | 60 |
-| `SCHEDULER_BATCH_SIZE` | 每轮最多入队的 Issue 数 | 10 |
-| `SCHEDULER_ISSUE_LIMIT` | 每轮最多扫描的 open Issue 数 | 100 |
-| `SCHEDULER_AGENT_CANDIDATE_LIMIT` | 每轮最多交给 Scheduler Agent 判断的候选数 | `SCHEDULER_ISSUE_LIMIT` |
-| `SCHEDULER_ELIGIBLE_LABELS` | 可调度标签；留空表示所有 open Issue | — |
-| `SCHEDULER_BLOCK_LABELS` | 阻止自动入队的标签 | `blocked` |
-| `SCHEDULER_SKIP_ASSIGNED_ISSUES` | 跳过已有 assignee 的 Issue | `true` |
-| `SCHEDULER_PRIORITY_LABELS` | 构建 Agent 候选短名单时使用的优先级标签提示 | `priority:critical,...` |
-| `RECONCILER_INTERVAL` | 过期租约扫描间隔秒数 | 60 |
-| `PLANNER_LEASE_SECONDS` | Planner 租约时长 | 7200 |
-| `WORKER_LEASE_SECONDS` | Worker 租约时长 | 21600 |
-
-旧变量 `CODERABBIT_POLL_INTERVAL` 和 `CODERABBIT_MAX_WAIT` 仍可作为兼容回退。
-
-## 后端选择
-
-全部角色使用同一后端：
-
-```env
-DEFAULT_BACKEND=codex
-=======
 ```bash
 python run.py --list-runs
 python run.py --inspect RUN_ID
->>>>>>> Stashed changes
 ```
 
 ## CI 与自动审查
