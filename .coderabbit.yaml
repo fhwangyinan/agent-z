@@ -1,0 +1,48 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: "zh-CN"
+early_access: false
+
+reviews:
+  profile: "assertive"
+  request_changes_workflow: false
+  high_level_summary: true
+  review_status: true
+  review_details: false
+  commit_status: true
+  fail_commit_status: true
+  poem: false
+  enable_prompt_for_ai_agents: true
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+    - "!**/__pycache__/**"
+    - "!**/*.pyc"
+    - "!.agent-z/**"
+  path_instructions:
+    - path: "orchestration/**/*.py"
+      instructions: |
+        重点检查状态机转换、SQLite 原子性、租约心跳、崩溃恢复、幂等性，
+        以及多 Planner/Worker 并发时的竞态、死锁和任务重复执行风险。
+    - path: "agents/**/*.py"
+      instructions: |
+        重点检查外部 CLI 调用的超时、重试、编码、session 恢复与错误分类。
+        避免把确定性错误误判为可重试错误。
+    - path: "tests/**/*.py"
+      instructions: |
+        检查测试是否覆盖成功、失败、恢复和并发边界，且 Mock 没有掩盖真实行为。
+    - path: ".github/workflows/**/*.yml"
+      instructions: |
+        检查 GitHub Actions 权限是否最小化，第三方 Action 是否固定到稳定主版本，
+        并确认来自 fork 的 PR 不会获得写权限或敏感信息。
+  pre_merge_checks:
+    title:
+      mode: "warning"
+      requirements: "标题应简洁说明用户可感知的改动或修复内容。"
+    description:
+      mode: "warning"
+    issue_assessment:
+      mode: "warning"
+
+chat:
+  auto_reply: true

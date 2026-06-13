@@ -1,5 +1,7 @@
 # Agent-Z
 
+[![CI](https://github.com/fhwangyinan/agent-z/actions/workflows/ci.yml/badge.svg)](https://github.com/fhwangyinan/agent-z/actions/workflows/ci.yml)
+
 [English](README.md)
 
 轻量级、后端无关的 coding-agent 自动化工具，实现自主开发循环。
@@ -41,10 +43,27 @@ python run.py --inspect RUN_ID     # 查看某个任务及事件时间线
 ```
 
 `--serve` 会启动一个 Scheduler、一个 Planner、一个 Reconciler，以及默认
-`SERVICE_WORKERS` 个 Worker。任一子进程异常退出后会自动重启；按 `Ctrl+C`
+`SERVICE_WORKERS` 个 Worker。任一子进程异常退出后会指数退避重启，连续失败后
+打开熔断；按 `Ctrl+C`
 统一停止全部进程。可用 `python run.py --serve --workers 4` 临时覆盖 Worker 数量，
 并将本次服务的最大并发任务数设为 4。
 默认 `--help` 只展示日常命令；使用 `python run.py --help-all` 查看池级和调参命令。
+
+`--serve` 使用固定一屏的全屏 Dashboard，不再把所有子进程输出持续堆到终端。
+界面展示进程健康状态、最近任务、选中详情和最近结构化事件。使用 `Tab` 在
+Processes 与 Tasks 间切换，方向键或 `j/k` 选择条目，`Enter` 或 `Space`
+展开任务详情或实时进程日志尾部，`q` 统一停止服务。新任务出现时会按 Run ID
+保持当前任务选择。每个子进程的完整原始输出保存在
+`.agent-z/logs/<process>.log`。
+
+### CI 与 CodeRabbit
+
+GitHub Actions 会在 Python 3.11、3.12、3.13 上运行完整单元测试，并执行独立的
+编译检查。Workflow 使用只读仓库权限，可以在 `main` 分支保护规则中设为必需检查。
+
+仓库也包含 `.coderabbit.yaml`，自动使用中文审查状态机、并发、恢复、外部 CLI
+调用和测试覆盖。要启用审查，需要在 [coderabbit.ai](https://coderabbit.ai/)
+为本仓库安装 CodeRabbit GitHub App；标准 GitHub App 集成不需要仓库 Secret。
 
 以下命令用于单任务处理、调试或独立扩缩：
 
@@ -89,7 +108,9 @@ python run.py --reconciler
 - 每个关键阶段展示完整 Run ID、Issue 编号、状态、阶段、租约角色和累计耗时。
 - Agent 调用展示后端/session 模式与执行耗时。
 - Worker、Planner、Scheduler、Reconciler 的空闲倒计时和运行时间在同一行实时刷新，不持续堆积 heartbeat 日志。
-- `--serve` 统一显示一条服务存活进程数与运行时间状态；任务、错误和重启事件仍保留为正常日志行。
+- `--serve` 使用固定一屏的进程/任务 Dashboard，可展开实时日志尾部；子进程完整输出写入 `.agent-z/logs/`。
+- Scheduler 每轮只批量获取一次 open PR，并按精确 Issue 引用映射，避免逐候选查询。
+- Worker 在开发前同时锁定预测文件与保守模块资源，Planner 瞬时失败会指数退避重试。
 - Agent 调用会实时显示已运行时间；PR checks 注册等待、检查等待和服务重启会显示动态时间状态。
 - PR Checks 使用结果表展示，并包含总等待时间。
 - 完成、跳过、失败、中断和 `needs_human` 使用统一终态摘要。
@@ -133,7 +154,7 @@ python run.py --reconciler
 
 每轮执行：
 
-1. **Issue 调度与入队** — Scheduler 先用确定性规则跳过已有 assignee、活动标签、相关 open PR 或未关闭依赖的 Issue，再只把候选 Issue 编号交给专职 Scheduler Agent，由 Agent 自行通过 `gh` 查看最新正文、标签、引用、相关 PR 和代码，判断候选是否是可独立交付的代码任务，并按预期收益、紧迫度、影响面、置信度、成本、风险和解锁价值排序。Tracking/meta issue、epic、roadmap、讨论、模糊请求等会被拒绝；标签只作为提示。Issue 正文可用 `Blocked by #123`、`Depends on #123` 或 `Requires #123` 声明依赖；互不依赖的高价值 Issue 会批量入队并可并行执行。Agent 输出异常时本轮不会入队，决策会写入事件日志并在每轮重新判断。旧版 Scheduler 已入队但尚未被 Planner 领取的任务也会重新审查；手动入队和已领取任务不会被自动取消。
+1. **Issue 调度与入队** — Scheduler 先用确定性规则跳过已有 assignee、活动标签、相关 open PR 或未关闭依赖的 Issue，再只把候选 Issue 编号交给专职 Scheduler Agent，由 Agent 自行通过 `gh` 查看最新正文、标签、引用、相关 PR 和代码，判断候选是否是可独立交付的代码任务，并按预期收益、紧迫度、影响面、置信度、成本、风险和解锁价值排序。Tracking/meta issue、epic、roadmap、讨论、模糊请求等会被拒绝；标签只作为提示。Issue 正文可用 `Blocked by #123`、`Depends on #123` 或 `Requires #123` 声明依赖；互不依赖的高价值 Issue 会批量入队并可并行执行。每次轻量扫描会持久化候选 Issue 的 `updatedAt`、相关 open PR 状态和队列状态；只有首次扫描、候选快照变化，或上次评估后 queued 任务被消费而需要补位时才调用 Agent。补位只补到 `SCHEDULER_BATCH_SIZE`，未变化但未满的队列不会被反复评估。Agent 输出异常时本轮不会入队，决策会写入事件日志。旧版 Scheduler 已入队但尚未被 Planner 领取的任务也会重新审查；手动入队和已领取任务不会被自动取消。
 2. **Task Lead 规划** — 按需探索相关 open Issue/PR，分析 Issue、评估影响、把可读结论写入 Issue，并持久化版本化结构执行计划：
    - `very_low` — 无影响
    - `low` — 轻微影响
@@ -227,14 +248,23 @@ Task Lead 只在需要时通过有针对性、可分页的查询探索 open Issu
 | `MAX_PARALLEL_TASKS` | 跨进程最大活跃任务数 | 2 |
 | `SERVICE_WORKERS` | `--serve` 默认启动的 Worker 数量 | `MAX_PARALLEL_TASKS` |
 | `SERVICE_RESTART_DELAY` | 服务子进程异常退出后的重启等待秒数 | 5 |
+| `SERVICE_RESTART_MAX_DELAY` | 服务子进程指数重启退避最大秒数 | 60 |
+| `SERVICE_RESTART_MAX_ATTEMPTS` | 连续重启多少次后打开熔断 | 5 |
+| `SERVICE_RESTART_RESET_SECONDS` | 连续健康运行多少秒后重置失败计数 | 300 |
+| `SERVICE_LOG_MAX_BYTES` | 单个服务子进程日志达到该字节数后轮转 | 5242880 |
+| `SERVICE_LOG_BACKUPS` | 保留的服务轮转日志数量 | 3 |
 | `MAX_RUN_SECONDS` | 单次执行时间预算 | 21600 |
 | `CLEANUP_COMPLETED_WORKTREES` | 成功后删除 worktree | `true` |
 | `CLEANUP_FAILED_WORKTREES` | 失败/needs-human 后删除 worktree，但保留分支与 label | `false` |
 | `WORKER_IDLE_SLEEP` | 队列 worker 空闲时的 sleep 秒数 | 30 |
+| `WORKER_PREFLIGHT_MAX_RETRIES` | 预检失败多少次后转为需要人工处理 | 3 |
 | `PLANNER_IDLE_SLEEP` | Planner 无待分析 Issue 时的 sleep 秒数 | 30 |
+| `PLANNER_MAX_RETRIES` | Planner 瞬时失败的最大尝试次数 | 3 |
+| `PLANNER_RETRY_BASE_DELAY` | Planner 首次重试等待秒数 | 10 |
 | `SCHEDULER_IDLE_SLEEP` | Scheduler 扫描间隔秒数 | 60 |
 | `SCHEDULER_BATCH_SIZE` | 每轮最多入队的 Issue 数 | 10 |
 | `SCHEDULER_ISSUE_LIMIT` | 每轮最多扫描的 open Issue 数 | 100 |
+| `SCHEDULER_PR_LIMIT` | 每轮一次性获取的 open PR 最大数量 | 500 |
 | `SCHEDULER_AGENT_CANDIDATE_LIMIT` | 每轮最多交给 Scheduler Agent 判断的候选数 | `SCHEDULER_ISSUE_LIMIT` |
 | `SCHEDULER_ELIGIBLE_LABELS` | 可调度标签；留空表示所有 open Issue | — |
 | `SCHEDULER_BLOCK_LABELS` | 阻止自动入队的标签 | `blocked` |

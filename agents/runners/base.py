@@ -27,9 +27,9 @@ class AgentResult:
 def decode_subprocess_output(data: bytes | str | None) -> str:
     if data is None or isinstance(data, str):
         return data or ""
-    encodings = ["utf-8", locale.getpreferredencoding(False)]
+    encodings = ["utf-8", locale.getpreferredencoding(False), "gbk"]
     if os.name == "nt":
-        encodings.extend(["gbk", "cp936"])
+        encodings.append("mbcs")
     for encoding in dict.fromkeys(encodings):
         try:
             return data.decode(encoding)

@@ -202,7 +202,13 @@ def _claim_changed_files(store: RunStore, record: RunRecord) -> RunRecord:
     ]
     return store.claim_files(record.run_id, files)
 
-def plan_task(record: RunRecord, store: RunStore, analyst: AnalystAgent) -> RunRecord:
+def plan_task(
+    record: RunRecord,
+    store: RunStore,
+    analyst: AnalystAgent,
+    *,
+    fail_on_error: bool = True,
+) -> RunRecord:
     started = time.monotonic()
     analyst.reset_session()
     analyst.session_id = (
@@ -269,10 +275,9 @@ def plan_task(record: RunRecord, store: RunStore, analyst: AnalystAgent) -> RunR
     except Exception as exc:
         failed = store.update(
             record.run_id,
-            status="failed",
-            stage="analyzing",
             sessions={"task_lead": analyst.session_id} if analyst.session_id else {},
             error=str(exc),
+            **({"status": "failed", "stage": "analyzing"} if fail_on_error else {}),
         )
         show_run_summary(
             failed,

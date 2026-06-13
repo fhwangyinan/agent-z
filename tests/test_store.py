@@ -61,6 +61,13 @@ class RunStoreTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "file lock conflict"):
             self.store.claim_files(second.run_id, ["src/shared.py", "src/other.py"])
 
+    def test_file_claim_detects_same_module_conflict(self):
+        first = self.store.create("owner/repo", 1, max_parallel=2)
+        second = self.store.create("owner/repo", 2, max_parallel=2)
+        self.store.claim_files(first.run_id, ["src/parser/reader.py"])
+        with self.assertRaisesRegex(RuntimeError, "module:src/parser"):
+            self.store.claim_files(second.run_id, ["src/parser/writer.py"])
+
     def test_queue_claims_oldest_task_when_slot_available(self):
         first = self.store.enqueue("owner/repo", 1)
         self.store.enqueue("owner/repo", 2)
@@ -123,6 +130,17 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(reconciled[0].status, "needs_human")
         self.assertEqual(reconciled[0].stage, "ready")
 
+    def test_heartbeat_atomically_requires_an_active_owned_lease(self):
+        queued = self.store.enqueue("owner/repo", 1)
+        planning = self.store.claim_for_planning(60, queued.run_id)
+        event_count = len(self.store.list_events(planning.run_id))
+        renewed = self.store.heartbeat(planning.run_id, "planner", 120)
+        self.assertEqual(renewed.lease_role, "planner")
+        self.assertEqual(len(self.store.list_events(planning.run_id)), event_count)
+        self.store.finish_planning(planning.run_id, plan={}, risk="low")
+        with self.assertRaisesRegex(RuntimeError, "not leased"):
+            self.store.heartbeat(planning.run_id, "planner", 120)
+
     def test_lists_stranded_submissions_for_recovery(self):
         run = self.store.create("owner/repo", 1, max_parallel=1)
         self.store.update(
@@ -167,6 +185,44 @@ class RunStoreTests(unittest.TestCase):
         self.store.update(final.run_id, status="completed")
         self.store.enqueue("other/repo", 3)
         self.assertEqual(self.store.active_issue_numbers("owner/repo"), {active.issue_number})
+
+    def test_scheduler_snapshot_and_queue_state_are_persisted(self):
+        queued = self.store.enqueue("owner/repo", 1)
+        planning = self.store.enqueue("owner/repo", 2)
+        self.store.claim_for_planning(60, planning.run_id)
+        self.assertEqual(
+            self.store.scheduler_queue_state("owner/repo"),
+            {"1": "queued", "2": "planning"},
+        )
+        candidates = {"3": {"updated_at": "now", "open_pr": False}}
+        queue_state = self.store.scheduler_queue_state("owner/repo")
+        self.store.save_scheduler_snapshot(
+            "owner/repo",
+            candidate_state=candidates,
+            queue_state=queue_state,
+            policy_state={"version": 1},
+        )
+        snapshot = self.store.get_scheduler_snapshot("owner/repo")
+        self.assertEqual(snapshot["candidate_state"], candidates)
+        self.assertEqual(snapshot["queue_state"], queue_state)
+        self.assertEqual(snapshot["policy_state"], {"version": 1})
+        self.assertTrue(snapshot["updated_at"])
+
+    def test_lists_recent_global_events_without_run_events(self):
+        run = self.store.enqueue("owner/repo", 1)
+        self.store.add_event(None, "scheduler_scan_failed", message="network")
+        self.store.add_event(run.run_id, "worker_claimed")
+        events = self.store.list_global_events()
+        self.assertEqual([event.event_type for event in events], ["scheduler_scan_failed"])
+
+    def test_counts_events_by_type(self):
+        run = self.store.enqueue("owner/repo", 1)
+        self.store.add_event(run.run_id, "worker_preflight_retry")
+        self.store.add_event(run.run_id, "worker_preflight_retry")
+        self.assertEqual(
+            self.store.count_events(run.run_id, "worker_preflight_retry"),
+            2,
+        )
 
     @patch("orchestration.store._pid_alive", return_value=True)
     def test_resume_rejects_run_owned_by_another_live_process(self, pid_alive):

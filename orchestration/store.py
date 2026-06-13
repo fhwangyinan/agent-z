@@ -38,6 +38,18 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _module_resources(files: set[str]) -> set[str]:
+    resources = set()
+    for path in files:
+        normalized = path.replace("\\", "/").strip("/")
+        parts = [part for part in normalized.split("/") if part]
+        if not parts:
+            continue
+        module = "/".join(parts[:2]) if len(parts) > 2 else normalized
+        resources.add(module)
+    return resources
+
+
 @dataclass
 class RunRecord:
     run_id: str
@@ -131,6 +143,17 @@ class RunStore:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS scheduler_snapshots (
+                    repo TEXT PRIMARY KEY,
+                    candidate_state TEXT NOT NULL DEFAULT '{}',
+                    queue_state TEXT NOT NULL DEFAULT '{}',
+                    policy_state TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE INDEX IF NOT EXISTS run_events_run_id_created_at
                 ON run_events(run_id, created_at)
                 """
@@ -161,6 +184,17 @@ class RunStore:
                 connection.execute("ALTER TABLE runs ADD COLUMN lease_role TEXT")
             if "lease_expires_at" not in columns:
                 connection.execute("ALTER TABLE runs ADD COLUMN lease_expires_at TEXT")
+            snapshot_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(scheduler_snapshots)"
+                ).fetchall()
+            }
+            if "policy_state" not in snapshot_columns:
+                connection.execute(
+                    "ALTER TABLE scheduler_snapshots "
+                    "ADD COLUMN policy_state TEXT NOT NULL DEFAULT '{}'"
+                )
 
     @staticmethod
     def _record(row: sqlite3.Row) -> RunRecord:
@@ -245,6 +279,29 @@ class RunStore:
                 (run_id, limit),
             ).fetchall()
         return [self._event(row) for row in rows]
+
+    def list_global_events(self, limit: int = 20) -> list[RunEvent]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM run_events
+                WHERE run_id IS NULL
+                ORDER BY event_id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [self._event(row) for row in reversed(rows)]
+
+    def count_events(self, run_id: str, event_type: str) -> int:
+        with self._connect() as connection:
+            return int(connection.execute(
+                """
+                SELECT COUNT(*) FROM run_events
+                WHERE run_id = ? AND event_type = ?
+                """,
+                (run_id, event_type),
+            ).fetchone()[0])
 
     def create(self, repo: str, issue_number: int, max_parallel: int) -> RunRecord:
         run_id = uuid.uuid4().hex[:12]
@@ -340,11 +397,12 @@ class RunStore:
                     (from_status, run_id),
                 ).fetchone()
             else:
+                order_column = "updated_at" if from_status == "ready" else "created_at"
                 row = connection.execute(
-                    """
+                    f"""
                     SELECT run_id, stage FROM runs
                     WHERE status = ?
-                    ORDER BY created_at
+                    ORDER BY {order_column}
                     LIMIT 1
                     """,
                     (from_status,),
@@ -427,10 +485,27 @@ class RunStore:
         )
 
     def heartbeat(self, run_id: str, role: str, lease_seconds: int) -> RunRecord:
-        record = self.get(run_id)
-        if record.lease_role != role or record.owner_pid != os.getpid():
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE runs
+                SET lease_expires_at = ?, updated_at = ?
+                WHERE run_id = ?
+                  AND lease_role = ?
+                  AND owner_pid = ?
+                  AND status IN ('planning', 'running', 'waiting_checks')
+                """,
+                (
+                    _lease_deadline(lease_seconds),
+                    _now(),
+                    run_id,
+                    role,
+                    os.getpid(),
+                ),
+            )
+        if cursor.rowcount != 1:
             raise RuntimeError(f"run {run_id} is not leased by this {role}")
-        return self.update(run_id, lease_expires_at=_lease_deadline(lease_seconds))
+        return self.get(run_id)
 
     def reconcile_expired(self) -> list[RunRecord]:
         """Recover abandoned planning leases and quarantine abandoned development."""
@@ -502,6 +577,67 @@ class RunStore:
                 (repo,),
             ).fetchall()
         return {int(row["issue_number"]) for row in rows}
+
+    def scheduler_queue_state(self, repo: str) -> dict[str, str]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT issue_number, status FROM runs
+                WHERE repo = ?
+                  AND status IN ('queued', 'planning', 'ready', 'running', 'waiting_checks')
+                ORDER BY issue_number
+                """,
+                (repo,),
+            ).fetchall()
+        return {str(row["issue_number"]): str(row["status"]) for row in rows}
+
+    def get_scheduler_snapshot(self, repo: str) -> dict | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT candidate_state, queue_state, policy_state, updated_at
+                FROM scheduler_snapshots WHERE repo = ?
+                """,
+                (repo,),
+            ).fetchone()
+        if row is None:
+            return None
+        return {
+            "candidate_state": json.loads(row["candidate_state"] or "{}"),
+            "queue_state": json.loads(row["queue_state"] or "{}"),
+            "policy_state": json.loads(row["policy_state"] or "{}"),
+            "updated_at": row["updated_at"],
+        }
+
+    def save_scheduler_snapshot(
+        self,
+        repo: str,
+        *,
+        candidate_state: dict,
+        queue_state: dict,
+        policy_state: dict | None = None,
+    ):
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO scheduler_snapshots (
+                    repo, candidate_state, queue_state, policy_state, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(repo) DO UPDATE SET
+                    candidate_state = excluded.candidate_state,
+                    queue_state = excluded.queue_state,
+                    policy_state = excluded.policy_state,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    repo,
+                    json.dumps(candidate_state, sort_keys=True),
+                    json.dumps(queue_state, sort_keys=True),
+                    json.dumps(policy_state or {}, sort_keys=True),
+                    _now(),
+                ),
+            )
 
     def list_scheduler_queued(self, repo: str) -> list[RunRecord]:
         with self._connect() as connection:
@@ -669,10 +805,17 @@ class RunStore:
                 (record.repo, run_id),
             ).fetchall()
             conflicts: dict[str, list[str]] = {}
+            requested_resources = _module_resources(requested)
             for row in rows:
-                overlap = requested & set(json.loads(row["touched_files"] or "[]"))
-                if overlap:
-                    conflicts[row["run_id"]] = sorted(overlap)
+                other_files = set(json.loads(row["touched_files"] or "[]"))
+                file_overlap = requested & other_files
+                module_overlap = requested_resources & _module_resources(other_files)
+                if file_overlap or module_overlap:
+                    details = [
+                        *(f"file:{path}" for path in sorted(file_overlap)),
+                        *(f"module:{path}" for path in sorted(module_overlap)),
+                    ]
+                    conflicts[row["run_id"]] = details
             if conflicts:
                 details = "; ".join(
                     f"{other}: {', '.join(paths)}"
