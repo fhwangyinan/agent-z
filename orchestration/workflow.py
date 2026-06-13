@@ -18,9 +18,10 @@ from config import (
     MAX_REVIEW_ROUNDS,
     MAX_RUN_SECONDS,
     PLANNER_LEASE_SECONDS,
+    SUBMISSION_NO_CHANGES_MAX_RETRIES,
     WORKER_LEASE_SECONDS,
 )
-from orchestration.errors import NeedsHumanError
+from orchestration.errors import NeedsHumanError, NoChangesError
 from orchestration.github_ops import (
     _base_sha,
     _get_issue_snapshot,
@@ -423,6 +424,9 @@ def execute_task(
                 record.issue_number,
                 plan=record.plan,
                 resume_session=bool(developer.session_id),
+                no_changes_retry=bool(
+                    store.count_events(record.run_id, "submission_no_changes_retry")
+                ),
             )
             record = _checkpoint(
                 store, record, analyst, developer, reviewer, submitter,
@@ -593,6 +597,58 @@ def execute_task(
             elapsed=time.monotonic() - started,
             message="Artifacts preserved for recovery",
             border_style="yellow",
+        )
+        raise
+    except NoChangesError as exc:
+        retry_count = store.count_events(record.run_id, "submission_no_changes_retry")
+        if retry_count < SUBMISSION_NO_CHANGES_MAX_RETRIES:
+            attempt = retry_count + 1
+            record = _checkpoint(
+                store, record, analyst, developer, reviewer, submitter,
+                status="ready",
+                stage="developing",
+                error=str(exc),
+                owner_pid=None,
+                lease_role=None,
+                lease_expires_at=None,
+            )
+            store.add_event(
+                record.run_id,
+                "submission_no_changes_retry",
+                stage="developing",
+                status="ready",
+                message="Submission had no commits; requeued for another development pass",
+                data={
+                    "attempt": attempt,
+                    "max_retries": SUBMISSION_NO_CHANGES_MAX_RETRIES,
+                },
+            )
+            show_run_summary(
+                record,
+                title="Run requeued",
+                elapsed=time.monotonic() - started,
+                message=(
+                    f"No changes were produced; retrying development "
+                    f"({attempt}/{SUBMISSION_NO_CHANGES_MAX_RETRIES})"
+                ),
+                border_style="yellow",
+            )
+            return False
+        record = _checkpoint(
+            store, record, analyst, developer, reviewer, submitter,
+            status="needs_human",
+            error=(
+                f"{exc}; no changes after "
+                f"{SUBMISSION_NO_CHANGES_MAX_RETRIES} automatic retry attempt(s)"
+            ),
+        )
+        cleanup_failed_run(record, store, worktrees)
+        show_run_summary(
+            record,
+            title="Run needs attention",
+            elapsed=time.monotonic() - started,
+            message=record.error,
+            border_style="red",
         )
         raise
     except Exception as exc:

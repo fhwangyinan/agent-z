@@ -3,7 +3,7 @@ import json
 from agents.base import log, run_cmd, warn
 from agents.developer import DeveloperAgent
 from config import GITHUB_REPO
-from orchestration.errors import NeedsHumanError
+from orchestration.errors import NeedsHumanError, NoChangesError
 from orchestration.store import RunRecord, RunStore
 
 def _verify_pr_url(pr_url: str) -> str:
@@ -51,6 +51,21 @@ def _find_open_pr_for_branch(branch: str | None) -> str:
         if str(pr.get("state", "")).upper() == "OPEN" and pr.get("url"):
             return str(pr["url"])
     return ""
+
+def branch_has_commits(worktree_path: str | None) -> bool | None:
+    if not worktree_path:
+        return None
+    result = run_cmd(
+        ["git", "rev-list", "--count", "origin/main..HEAD"],
+        cwd=worktree_path,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        return int(result.stdout.strip()) > 0
+    except ValueError:
+        return None
 
 def _issue_title_for_pr(issue_number: int) -> str:
     result = run_cmd(
@@ -155,6 +170,14 @@ def _create_pr_deterministically(record: RunRecord, metadata: dict | None = None
         if commit.returncode != 0:
             details = (commit.stderr or commit.stdout).strip()
             raise NeedsHumanError(f"could not commit changes before PR creation: {details}")
+
+    has_commits = branch_has_commits(record.worktree_path)
+    if has_commits is None:
+        raise NeedsHumanError("could not compare branch with origin/main before PR creation")
+    if not has_commits:
+        raise NoChangesError(
+            f"no commits between main and {record.branch}; development produced no changes"
+        )
 
     push = run_cmd(
         ["git", "push", "--set-upstream", "origin", record.branch],

@@ -15,6 +15,7 @@ from config import (
     RECONCILER_INTERVAL,
     SCHEDULER_IDLE_SLEEP,
     STATE_DB,
+    SUBMISSION_NO_CHANGES_MAX_RETRIES,
     WORKER_IDLE_SLEEP,
     WORKER_LEASE_SECONDS,
     WORKER_PREFLIGHT_MAX_RETRIES,
@@ -23,7 +24,7 @@ from config import (
 )
 from orchestration.github_ops import cleanup_run_artifacts, validate_environment
 from orchestration.scheduler import schedule_once
-from orchestration.submission import _find_open_pr_for_branch
+from orchestration.submission import _find_open_pr_for_branch, branch_has_commits
 from orchestration.store import RunStore
 from orchestration.tui import show_banner, show_pool_status, wait_with_status
 from orchestration.workflow import _build_agents, execute_task, plan_task
@@ -500,25 +501,58 @@ def run_reconciler(*, once: bool = False, interval: int = RECONCILER_INTERVAL) -
             )
         for record in store.list_submission_recovery_candidates():
             pr_url = _find_open_pr_for_branch(record.branch)
-            if not pr_url:
+            if pr_url:
+                store.update(
+                    record.run_id,
+                    status="ready",
+                    stage="waiting_checks",
+                    pr_url=pr_url,
+                    error=None,
+                )
+                store.add_event(
+                    record.run_id,
+                    "external_pr_adopted",
+                    stage="waiting_checks",
+                    status="ready",
+                    message="Adopted an externally created PR for the stranded branch",
+                    data={"pr_url": pr_url, "branch": record.branch},
+                )
+                done(f"Adopted external PR for run {record.run_id}: {pr_url}")
+                total += 1
                 continue
-            store.update(
-                record.run_id,
-                status="ready",
-                stage="waiting_checks",
-                pr_url=pr_url,
-                error=None,
+            retry_count = store.count_events(
+                record.run_id, "submission_no_changes_retry"
             )
-            store.add_event(
-                record.run_id,
-                "external_pr_adopted",
-                stage="waiting_checks",
-                status="ready",
-                message="Adopted an externally created PR for the stranded branch",
-                data={"pr_url": pr_url, "branch": record.branch},
-            )
-            done(f"Adopted external PR for run {record.run_id}: {pr_url}")
-            total += 1
+            if (
+                retry_count < SUBMISSION_NO_CHANGES_MAX_RETRIES
+                and branch_has_commits(record.worktree_path) is False
+            ):
+                attempt = retry_count + 1
+                store.update(
+                    record.run_id,
+                    status="ready",
+                    stage="developing",
+                    error=None,
+                )
+                store.add_event(
+                    record.run_id,
+                    "submission_no_changes_retry",
+                    stage="developing",
+                    status="ready",
+                    message=(
+                        "Reconciler requeued submission with no commits for "
+                        "another development pass"
+                    ),
+                    data={
+                        "attempt": attempt,
+                        "max_retries": SUBMISSION_NO_CHANGES_MAX_RETRIES,
+                    },
+                )
+                done(
+                    f"Requeued no-change submission {record.run_id} "
+                    f"({attempt}/{SUBMISSION_NO_CHANGES_MAX_RETRIES})"
+                )
+                total += 1
         if once:
             show_pool_status(
                 "Reconciler",

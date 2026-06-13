@@ -5,6 +5,17 @@ from agents.developer import DeveloperAgent
 
 
 class DeveloperSubmissionTests(unittest.TestCase):
+    @patch("agents.developer.DeveloperAgent.run", return_value="done")
+    def test_no_changes_retry_prompt_requires_an_actual_implementation(self, run_agent):
+        developer = DeveloperAgent.__new__(DeveloperAgent)
+        developer.session_id = "lead-session"
+
+        developer.fix(5, resume_session=True, no_changes_retry=True)
+
+        prompt = run_agent.call_args.args[0]
+        self.assertIn("previous development pass", prompt)
+        self.assertIn("Implement and test the required change", prompt)
+
     @patch(
         "agents.developer.DeveloperAgent.run",
         return_value=(

@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 
 import run
 import orchestration.github_ops
+import orchestration.errors
 import orchestration.pools
 import orchestration.submission
 import orchestration.tui
@@ -393,11 +394,12 @@ class SubmissionRecoveryTests(QuietRunTest):
         self.assertEqual(run.resolve_submission(record), ("", ""))
 
     @patch("orchestration.submission._find_open_pr_for_branch", side_effect=["", ""])
+    @patch("orchestration.submission.branch_has_commits", return_value=True)
     @patch("orchestration.submission._verify_pr_url", return_value="https://example/pr/3")
     @patch("orchestration.submission._issue_title_for_pr", return_value="Fix issue")
     @patch("orchestration.submission.run_cmd")
     def test_deterministic_submission_pushes_and_creates_pr(
-        self, run_cmd, issue_title, verify, find
+        self, run_cmd, issue_title, verify, has_commits, find
     ):
         run_cmd.side_effect = [
             result(stdout=""),
@@ -422,10 +424,11 @@ class SubmissionRecoveryTests(QuietRunTest):
         "orchestration.submission._find_open_pr_for_branch",
         side_effect=["", "https://example/pr/recovered"],
     )
+    @patch("orchestration.submission.branch_has_commits", return_value=True)
     @patch("orchestration.submission._issue_title_for_pr", return_value="Fix issue")
     @patch("orchestration.submission.run_cmd")
     def test_pr_create_failure_adopts_pr_created_before_network_failure(
-        self, run_cmd, issue_title, find
+        self, run_cmd, issue_title, has_commits, find
     ):
         run_cmd.side_effect = [
             result(stdout=""),
@@ -442,6 +445,28 @@ class SubmissionRecoveryTests(QuietRunTest):
             orchestration.submission._create_pr_deterministically(record),
             "https://example/pr/recovered",
         )
+
+    @patch("orchestration.submission.branch_has_commits", return_value=False)
+    @patch("orchestration.submission._issue_title_for_pr", return_value="Fix issue")
+    @patch("orchestration.submission.run_cmd", return_value=result(stdout=""))
+    def test_deterministic_submission_rejects_branch_without_commits(
+        self, run_cmd, issue_title, has_commits
+    ):
+        record = SimpleNamespace(
+            run_id="run-1",
+            issue_number=1,
+            branch="agent-z/1-run",
+            worktree_path="worktree",
+        )
+
+        with self.assertRaisesRegex(
+            orchestration.errors.NoChangesError,
+            "no commits between main",
+        ):
+            orchestration.submission._create_pr_deterministically(record)
+
+        commands = [call.args[0][:2] for call in run_cmd.call_args_list]
+        self.assertNotIn(["git", "push"], commands)
 
     @patch("orchestration.submission._issue_title_for_pr", return_value="Fallback title")
     def test_submission_metadata_is_sanitized_and_closes_issue(self, issue_title):
@@ -481,6 +506,50 @@ class SubmissionRecoveryTests(QuietRunTest):
         self.assertEqual(metadata["commit_message"], "fix: persisted")
         developer.prepare_submission.assert_not_called()
         self.assertEqual(store.add_event.call_args.args[1], "submission_metadata_reused")
+
+    @patch("orchestration.workflow.SUBMISSION_NO_CHANGES_MAX_RETRIES", 1)
+    @patch(
+        "orchestration.workflow.resolve_submission",
+        side_effect=orchestration.errors.NoChangesError("no commits"),
+    )
+    def test_execute_task_requeues_first_submission_without_changes(self, resolve):
+        record = SimpleNamespace(
+            run_id="run-1",
+            issue_number=1,
+            status="running",
+            stage="submitting",
+            worktree_path="worktree",
+            branch="agent-z/1-run",
+            sessions={},
+            plan={},
+            risk="low",
+        )
+        requeued = SimpleNamespace(
+            **{
+                **record.__dict__,
+                "status": "ready",
+                "stage": "developing",
+                "error": "no commits",
+                "lease_role": None,
+            }
+        )
+        store = Mock()
+        store.count_events.return_value = 0
+        store.update.return_value = requeued
+        worktrees = Mock()
+        worktrees.validate.return_value = "worktree"
+        agents = [Mock(session_id=None) for _ in range(4)]
+        for agent in agents:
+            agent.reset_session.side_effect = lambda: None
+
+        self.assertFalse(
+            run.execute_task(record, store, worktrees, *agents)
+        )
+
+        self.assertEqual(store.update.call_args.kwargs["status"], "ready")
+        self.assertEqual(store.update.call_args.kwargs["stage"], "developing")
+        event_types = [call.args[1] for call in store.add_event.call_args_list]
+        self.assertIn("submission_no_changes_retry", event_types)
 
 
 class CleanupTests(QuietRunTest):
@@ -950,6 +1019,37 @@ class ReconcilerTests(QuietRunTest):
             error=None,
         )
         self.assertEqual(store.add_event.call_args_list[-1].args[1], "external_pr_adopted")
+
+    @patch("orchestration.pools.SUBMISSION_NO_CHANGES_MAX_RETRIES", 1)
+    @patch("orchestration.pools.branch_has_commits", return_value=False)
+    @patch("orchestration.pools._find_open_pr_for_branch", return_value="")
+    @patch("orchestration.pools.RunStore")
+    def test_reconciler_requeues_stranded_submission_without_commits(
+        self, store_class, find_pr, has_commits
+    ):
+        record = SimpleNamespace(
+            run_id="run-1",
+            branch="agent-z/1-run",
+            worktree_path="worktree",
+        )
+        store = Mock()
+        store.reconcile_expired.return_value = []
+        store.list_submission_recovery_candidates.return_value = [record]
+        store.count_events.return_value = 0
+        store_class.return_value = store
+
+        self.assertEqual(run.run_reconciler(once=True, interval=1), 1)
+
+        store.update.assert_called_once_with(
+            "run-1",
+            status="ready",
+            stage="developing",
+            error=None,
+        )
+        self.assertEqual(
+            store.add_event.call_args_list[-1].args[1],
+            "submission_no_changes_retry",
+        )
 
 
 if __name__ == "__main__":

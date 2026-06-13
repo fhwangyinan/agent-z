@@ -14,6 +14,7 @@ class DeveloperAgent(Agent):
         issue_number: int,
         plan: dict | None = None,
         resume_session: bool = False,
+        no_changes_retry: bool = False,
     ) -> str:
         plan_context = ""
         if plan:
@@ -23,7 +24,17 @@ class DeveloperAgent(Agent):
                 "current code before editing, and satisfy its acceptance criteria:\n"
                 f"{json.dumps(plan, ensure_ascii=True, indent=2)}"
             )
-        prompt = f"Fix issue #{issue_number}.{plan_context} Gather any additional information you need."
+        retry_context = ""
+        if no_changes_retry:
+            retry_context = (
+                "\nThe previous development pass reached submission without producing any commit "
+                "relative to main. Re-read the issue and inspect the repository carefully. Implement "
+                "and test the required change; do not stop merely because the current tree is clean."
+            )
+        prompt = (
+            f"Fix issue #{issue_number}.{plan_context}{retry_context} "
+            "Gather any additional information you need."
+        )
         return self.run(prompt, timeout=TIMEOUT_DEVELOPER, resume_session=resume_session)
 
     def apply_review(
