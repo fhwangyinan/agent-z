@@ -207,6 +207,28 @@ class ServiceDashboardTests(unittest.TestCase):
         self.assertIn(">scheduler", text.replace(" ", ""))
         self.assertNotIn("#99", text)
 
+    def test_dashboard_shows_context_shortcuts_and_confirmation(self):
+        store = Mock()
+        store.list.return_value = []
+        store.list_global_events.return_value = []
+        process = Mock(pid=123)
+        process.poll.return_value = None
+        service = SimpleNamespace(name="scheduler", process=process, restarts=0)
+
+        dashboard, _ = render_service_dashboard(
+            store,
+            [service],
+            focus="processes",
+            confirmation="Press r again within 5s to restart scheduler",
+        )
+
+        output = Console(file=io.StringIO(), record=True, width=120)
+        output.print(dashboard)
+        self.assertIn(
+            "Press r again within 5s to restart scheduler",
+            output.export_text(),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

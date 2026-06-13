@@ -58,8 +58,10 @@ in one place.
 ```
 
 Use `Tab` to switch panes, `j/k` or arrow keys to select, `Enter` or `Space` to
-expand, and `q` to stop the service. Child logs are preserved under
-`.agent-z/logs/`.
+expand, and `o` to open the selected task's PR or issue. Press `c` twice to
+cancel the selected task, `r` twice to restart the selected process, or `q`
+twice to stop all services. Dangerous actions require the matching key again
+within five seconds. Child logs are preserved under `.agent-z/logs/`.
 
 ## How It Works
 

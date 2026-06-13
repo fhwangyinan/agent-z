@@ -548,6 +548,7 @@ def render_service_dashboard(
     expanded: bool = False,
     uptime: float = 0,
     notices: list[str] | None = None,
+    confirmation: str | None = None,
 ):
     records = store.list(limit=20)
     global_events = [
@@ -570,10 +571,20 @@ def render_service_dashboard(
         if getattr(service, "process", None) is not None
         and service.process.poll() is None
     )
+    shortcuts = (
+        "Tab processes | ↑/↓ select | Enter expand | o open | c cancel | q stop all"
+        if focus == "tasks"
+        else "Tab tasks | ↑/↓ select | Enter expand log | r restart process | q stop all"
+    )
+    header_status = (
+        f"[bold yellow]{escape(confirmation)}[/bold yellow]"
+        if confirmation
+        else f"[dim]{shortcuts}[/dim]"
+    )
     header = Panel(
         f"[bold cyan]Agent-Z Service[/bold cyan]  "
         f"[dim]alive:{alive}/{len(services)} | uptime:{format_duration(uptime)}[/dim]\n"
-        "[dim]Tab switch pane  |  ↑/↓ or j/k select  |  Enter/Space expand  |  q stop[/dim]",
+        f"{header_status}",
         border_style="cyan",
     )
     service_panel = Panel(

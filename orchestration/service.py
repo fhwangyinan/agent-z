@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import time
+import webbrowser
 from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from orchestration.store import RunStore
 from orchestration.tui import console, render_service_dashboard
 
 MAX_SERVICE_NOTICES = 200
+ACTION_CONFIRM_SECONDS = 5
 
 
 @dataclass
@@ -41,6 +43,15 @@ class ServiceProcess:
     started_at: float | None = None
     consecutive_failures: int = 0
     circuit_open: bool = False
+
+
+@dataclass
+class PendingAction:
+    key: str
+    action: str
+    target: str
+    prompt: str
+    expires_at: float
 
 
 def service_specs(
@@ -143,6 +154,50 @@ def _stop(service: ServiceProcess):
         service.log_handle = None
 
 
+def _confirm_action(
+    pending: PendingAction | None,
+    *,
+    key: str,
+    action: str,
+    target: str,
+    prompt: str,
+    now: float,
+) -> tuple[PendingAction | None, bool]:
+    if (
+        pending is not None
+        and pending.key == key
+        and pending.action == action
+        and pending.target == target
+        and now <= pending.expires_at
+    ):
+        return None, True
+    return (
+        PendingAction(
+            key=key,
+            action=action,
+            target=target,
+            prompt=prompt,
+            expires_at=now + ACTION_CONFIRM_SECONDS,
+        ),
+        False,
+    )
+
+
+def _restart_service(service: ServiceProcess, *, max_parallel: int) -> subprocess.Popen:
+    _stop(service)
+    service.consecutive_failures = 0
+    service.circuit_open = False
+    process = _spawn(service, max_parallel=max_parallel)
+    service.restarts += 1
+    return process
+
+
+def _open_task(record) -> str:
+    url = record.pr_url or f"https://github.com/{record.repo}/issues/{record.issue_number}"
+    webbrowser.open(url)
+    return url
+
+
 def _read_dashboard_key() -> str | None:
     if os.name == "nt":
         import msvcrt
@@ -216,6 +271,7 @@ def run_service(
     selected_service = 0
     focus = "tasks"
     expanded = False
+    pending_action = None
     try:
         for service in services:
             process = _spawn(service, max_parallel=workers)
@@ -228,6 +284,10 @@ def run_service(
                 refresh_per_second=4,
             ) as live:
                 while True:
+                    now = time.monotonic()
+                    if pending_action is not None and now > pending_action.expires_at:
+                        notices.append(f"Cancelled {pending_action.action}: confirmation timed out")
+                        pending_action = None
                     records = store.list(limit=20)
                     if focus == "tasks":
                         if selected_run_id:
@@ -250,12 +310,83 @@ def run_service(
                         expanded=expanded,
                         uptime=time.monotonic() - started,
                         notices=list(notices),
+                        confirmation=pending_action.prompt if pending_action else None,
                     )
                     live.update(dashboard)
                     key = key_reader()
+                    if key is not None and pending_action is not None and key != pending_action.key:
+                        notices.append(f"Cancelled {pending_action.action}")
+                        pending_action = None
                     if key == "q":
-                        notices.append("Stopping service by user request")
-                        break
+                        pending_action, confirmed = _confirm_action(
+                            pending_action,
+                            key="q",
+                            action="stop all services",
+                            target="service",
+                            prompt="Press q again within 5s to stop all services",
+                            now=time.monotonic(),
+                        )
+                        if confirmed:
+                            notices.append("Stopping service by user request")
+                            break
+                    elif key == "r" and focus == "processes" and services:
+                        service = services[selected_service]
+                        pending_action, confirmed = _confirm_action(
+                            pending_action,
+                            key="r",
+                            action=f"restart {service.name}",
+                            target=service.name,
+                            prompt=f"Press r again within 5s to restart {service.name}",
+                            now=time.monotonic(),
+                        )
+                        if confirmed:
+                            try:
+                                process = _restart_service(service, max_parallel=workers)
+                                notices.append(
+                                    f"Restarted {service.name} by user request | "
+                                    f"PID {process.pid}"
+                                )
+                                store.add_event(
+                                    None,
+                                    "service_process_restarted",
+                                    message=f"Restarted {service.name} by user request",
+                                    data={"service": service.name, "pid": process.pid},
+                                )
+                            except Exception as exc:
+                                notices.append(f"Could not restart {service.name}: {exc}")
+                    elif key == "c" and focus == "tasks" and records:
+                        record = records[selected]
+                        pending_action, confirmed = _confirm_action(
+                            pending_action,
+                            key="c",
+                            action=f"cancel task #{record.issue_number}",
+                            target=record.run_id,
+                            prompt=(
+                                f"Press c again within 5s to cancel task "
+                                f"#{record.issue_number}"
+                            ),
+                            now=time.monotonic(),
+                        )
+                        if confirmed:
+                            try:
+                                store.cancel(record.run_id)
+                                notices.append(
+                                    f"Cancelled task #{record.issue_number} | "
+                                    f"run {record.run_id}"
+                                )
+                            except Exception as exc:
+                                notices.append(
+                                    f"Could not cancel task #{record.issue_number}: {exc}"
+                                )
+                    elif key == "o" and focus == "tasks" and records:
+                        record = records[selected]
+                        try:
+                            url = _open_task(record)
+                            notices.append(f"Opened task #{record.issue_number} | {url}")
+                        except Exception as exc:
+                            notices.append(
+                                f"Could not open task #{record.issue_number}: {exc}"
+                            )
                     if key == "tab":
                         focus = "processes" if focus == "tasks" else "tasks"
                         expanded = False
@@ -319,6 +450,9 @@ def run_service(
                                     f"Restarting {service.name} in "
                                     f"{max(0, int(deadline - time.monotonic() + 0.999))}s"
                                 ],
+                                confirmation=(
+                                    pending_action.prompt if pending_action else None
+                                ),
                             )
                             live.update(dashboard)
                             sleep(min(0.25, max(0, deadline - time.monotonic())))

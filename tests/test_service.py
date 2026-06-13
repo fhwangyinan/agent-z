@@ -4,8 +4,12 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from orchestration.service import (
+    PendingAction,
     ServiceProcess,
+    _confirm_action,
+    _open_task,
     _register_service_failure,
+    _restart_service,
     _spawn,
     run_service,
     service_specs,
@@ -33,6 +37,62 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(_register_service_failure(service), 5)
             self.assertIsNone(_register_service_failure(service))
         self.assertTrue(service.circuit_open)
+
+    def test_dangerous_action_requires_matching_second_key_before_timeout(self):
+        pending, confirmed = _confirm_action(
+            None,
+            key="r",
+            action="restart scheduler",
+            target="scheduler",
+            prompt="confirm",
+            now=10,
+        )
+        self.assertIsInstance(pending, PendingAction)
+        self.assertFalse(confirmed)
+
+        pending, confirmed = _confirm_action(
+            pending,
+            key="r",
+            action="restart scheduler",
+            target="scheduler",
+            prompt="confirm",
+            now=11,
+        )
+        self.assertIsNone(pending)
+        self.assertTrue(confirmed)
+
+    @patch("orchestration.service._spawn")
+    @patch("orchestration.service._stop")
+    def test_manual_restart_resets_circuit(self, stop, spawn):
+        service = ServiceProcess(
+            "scheduler",
+            ["--scheduler"],
+            consecutive_failures=4,
+            circuit_open=True,
+        )
+        process = Mock(pid=42)
+        spawn.return_value = process
+
+        self.assertIs(_restart_service(service, max_parallel=2), process)
+
+        stop.assert_called_once_with(service)
+        spawn.assert_called_once_with(service, max_parallel=2)
+        self.assertEqual(service.consecutive_failures, 0)
+        self.assertFalse(service.circuit_open)
+        self.assertEqual(service.restarts, 1)
+
+    @patch("orchestration.service.webbrowser.open")
+    def test_open_task_prefers_pr_url(self, open_browser):
+        record = Mock(
+            pr_url="https://github.com/example/repo/pull/7",
+            repo="example/repo",
+            issue_number=42,
+        )
+
+        url = _open_task(record)
+
+        self.assertEqual(url, record.pr_url)
+        open_browser.assert_called_once_with(record.pr_url)
 
     @patch("orchestration.service.subprocess.Popen")
     def test_spawn_passes_service_concurrency_to_children(self, popen):
@@ -116,8 +176,46 @@ class ServiceTests(unittest.TestCase):
         self, spawn, stop, live, render, validate_environment
     ):
         spawn.side_effect = lambda service, *, max_parallel: Mock(pid=1)
-        self.assertEqual(run_service(workers=1, key_reader=lambda: "q"), 0)
+        keys = iter(["q", "q"])
+        self.assertEqual(run_service(workers=1, key_reader=lambda: next(keys)), 0)
         self.assertEqual(stop.call_count, 4)
+
+    @patch("orchestration.service.validate_environment")
+    @patch("orchestration.service.render_service_dashboard", return_value=(Mock(), 1))
+    @patch("orchestration.service.Live")
+    @patch("orchestration.service._stop")
+    @patch("orchestration.service._spawn")
+    @patch("orchestration.service.RunStore")
+    def test_c_cancels_selected_task_after_confirmation(
+        self, store_class, spawn, stop, live, render, validate_environment
+    ):
+        record = Mock(run_id="run-1", issue_number=42)
+        store = store_class.return_value
+        store.list.return_value = [record]
+        spawn.side_effect = lambda service, *, max_parallel: Mock(pid=1)
+        keys = iter(["c", "c", "q", "q"])
+
+        self.assertEqual(run_service(workers=1, key_reader=lambda: next(keys)), 0)
+
+        store.cancel.assert_called_once_with("run-1")
+
+    @patch("orchestration.service.validate_environment")
+    @patch("orchestration.service.render_service_dashboard", return_value=(Mock(), 0))
+    @patch("orchestration.service.Live")
+    @patch("orchestration.service._stop")
+    @patch("orchestration.service._restart_service")
+    @patch("orchestration.service._spawn")
+    def test_r_restarts_selected_process_after_confirmation(
+        self, spawn, restart, stop, live, render, validate_environment
+    ):
+        spawn.side_effect = lambda service, *, max_parallel: Mock(pid=1)
+        restart.return_value = Mock(pid=99)
+        keys = iter(["tab", "r", "r", "q", "q"])
+
+        self.assertEqual(run_service(workers=1, key_reader=lambda: next(keys)), 0)
+
+        restart.assert_called_once()
+        self.assertEqual(restart.call_args.args[0].name, "scheduler")
 
 
 if __name__ == "__main__":
