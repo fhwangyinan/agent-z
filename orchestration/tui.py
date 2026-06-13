@@ -418,13 +418,17 @@ def _service_table(
     global_events,
     selected_service: int | None = None,
 ) -> Table:
-    table = Table(box=box.SIMPLE, expand=True, show_edge=False)
-    table.add_column("", width=2)
-    table.add_column("Process", width=12, no_wrap=True)
-    table.add_column("PID", justify="right", width=7)
-    table.add_column("State", width=12, no_wrap=True)
-    table.add_column("Activity", overflow="ellipsis", no_wrap=True)
-    table.add_column("R", justify="right", width=3)
+    table = Table(box=box.SIMPLE, expand=True, show_edge=False, padding=(0, 0))
+    table.add_column("Process", width=14, min_width=10, max_width=14, no_wrap=True)
+    table.add_column("State", width=14, min_width=8, max_width=14, no_wrap=True)
+    table.add_column(
+        "Activity",
+        min_width=8,
+        max_width=32,
+        ratio=1,
+        overflow="ellipsis",
+        no_wrap=True,
+    )
     for index, service in enumerate(services):
         process = getattr(service, "process", None)
         returncode = process.poll() if process is not None else None
@@ -433,13 +437,14 @@ def _service_table(
             state = "[bold red]CIRCUIT OPEN[/bold red]"
         else:
             state = "[green]RUNNING[/green]" if alive else f"[red]EXIT {returncode}[/red]"
+        restarts = int(getattr(service, "restarts", 0))
+        if restarts:
+            state += f" [dim]r{restarts}[/dim]"
         table.add_row(
-            ">" if selected_service == index else "",
-            str(getattr(service, "name", "unknown")),
-            str(getattr(process, "pid", "-")),
+            f"{'>' if selected_service == index else ' '} "
+            f"{getattr(service, 'name', 'unknown')}",
             state,
             _service_activity(service, records, global_events),
-            str(getattr(service, "restarts", 0)),
         )
     return table
 

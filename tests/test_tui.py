@@ -179,6 +179,34 @@ class ServiceDashboardTests(unittest.TestCase):
         self.assertIn("No persisted tasks yet", text)
         self.assertIn("Scheduler scan started", text)
 
+    def test_long_process_activity_does_not_hide_selection_cursor(self):
+        store = Mock()
+        store.list.return_value = []
+        store.list_global_events.return_value = [
+            SimpleNamespace(
+                event_type="scheduler_agent_started",
+                message="Scheduler Agent evaluating " + ", ".join(
+                    f"#{number}" for number in range(1, 100)
+                ),
+            ),
+        ]
+        process = Mock(pid=12345)
+        process.poll.return_value = None
+        service = SimpleNamespace(name="scheduler", process=process, restarts=0)
+
+        dashboard, _ = render_service_dashboard(
+            store,
+            [service],
+            focus="processes",
+            selected_service=0,
+        )
+
+        output = Console(file=io.StringIO(), record=True, width=80)
+        output.print(dashboard)
+        text = output.export_text()
+        self.assertIn(">scheduler", text.replace(" ", ""))
+        self.assertNotIn("#99", text)
+
 
 if __name__ == "__main__":
     unittest.main()
