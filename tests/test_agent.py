@@ -1,8 +1,12 @@
 import unittest
+import subprocess
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 from agents.base import Agent
 from agents.runners.base import AgentResult, BackendCapabilities
+from orchestration.errors import WorkspaceIsolationError
 
 
 class FakeRunner:
@@ -44,6 +48,75 @@ class AgentSessionTests(unittest.TestCase):
         first.reset_session()
         first.run("new task", resume_session=True)
         self.assertEqual(first_runner.sessions[-1], None)
+
+
+class AgentWorkspaceIsolationTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.project = Path(self.temp.name) / "project"
+        self.worktree = Path(self.temp.name) / "worktree"
+        self.project.mkdir()
+        self._git(self.project, "init", "-b", "main")
+        self._git(self.project, "config", "user.email", "test@example.com")
+        self._git(self.project, "config", "user.name", "Test")
+        (self.project / "file.txt").write_text("base", encoding="utf-8")
+        self._git(self.project, "add", "file.txt")
+        self._git(self.project, "commit", "-m", "base")
+        self._git(self.project, "worktree", "add", "-b", "agent-z/1-run", str(self.worktree))
+
+    @staticmethod
+    def _git(cwd, *args):
+        subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    @patch("agents.base.done")
+    @patch("agents.base.agent_status")
+    def test_task_prompt_declares_workspace_boundary(self, status, done):
+        runner = FakeRunner("developer")
+        agent = Agent("Developer", "fake", runner=runner)
+        agent.set_workspace(str(self.worktree))
+
+        with patch("agents.base.PROJECT_DIR", str(self.project)):
+            output = agent.run("Fix it")
+
+        self.assertIn("WORKSPACE BOUNDARY", output)
+        self.assertIn(str(self.worktree.resolve()), output)
+        self.assertIn("Stay on task branch: agent-z/1-run", output)
+
+    @patch("agents.base.done")
+    @patch("agents.base.agent_status")
+    def test_task_agent_refuses_protected_branch(self, status, done):
+        agent = Agent("Developer", "fake", runner=FakeRunner("developer"))
+        agent.set_workspace(str(self.project))
+
+        with patch("agents.base.PROJECT_DIR", str(self.worktree)):
+            with self.assertRaisesRegex(WorkspaceIsolationError, "protected branch main"):
+                agent.run("Fix it")
+
+    @patch("agents.base.done")
+    @patch("agents.base.agent_status")
+    def test_task_agent_detects_main_head_change(self, status, done):
+        runner = FakeRunner("developer")
+
+        def change_main(*args, **kwargs):
+            (self.project / "leak.txt").write_text("leak", encoding="utf-8")
+            self._git(self.project, "add", "leak.txt")
+            self._git(self.project, "commit", "-m", "leaked")
+            return AgentResult("done", "session")
+
+        runner.execute = change_main
+        agent = Agent("Developer", "fake", runner=runner)
+        agent.set_workspace(str(self.worktree))
+
+        with patch("agents.base.PROJECT_DIR", str(self.project)):
+            with self.assertRaisesRegex(WorkspaceIsolationError, "main checkout HEAD changed"):
+                agent.run("Fix it")
 
 
 if __name__ == "__main__":

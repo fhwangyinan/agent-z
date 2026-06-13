@@ -687,6 +687,33 @@ class RoundFlowTests(QuietRunTest):
 
 
 class ValidationTests(QuietRunTest):
+    @patch("orchestration.github_ops.run_cmd")
+    def test_base_repo_rejects_local_commits_on_main(self, run_cmd):
+        run_cmd.side_effect = [
+            result(stdout=""),
+            result(stdout="2\n"),
+        ]
+
+        with self.assertRaisesRegex(run.NeedsHumanError, "ahead of origin/main by 2"):
+            orchestration.github_ops.prepare_base_repo()
+
+    @patch("orchestration.github_ops.run_cmd")
+    def test_base_repo_fetches_when_checkout_is_safe(self, run_cmd):
+        run_cmd.side_effect = [
+            result(stdout=""),
+            result(stdout="0\n"),
+            result(),
+            result(stdout=""),
+            result(stdout="0\n"),
+        ]
+
+        orchestration.github_ops.prepare_base_repo()
+
+        self.assertEqual(
+            run_cmd.call_args_list[2].args[0],
+            ["git", "fetch", "origin", "main"],
+        )
+
     @patch("orchestration.github_ops.os.path.isdir", return_value=False)
     def test_missing_project_directory_fails_fast(self, isdir):
         with self.assertRaisesRegex(RuntimeError, "PROJECT_DIR does not exist"):

@@ -54,8 +54,36 @@ def validate_environment(*, require_backends: bool = True):
 
 def prepare_base_repo():
     step("[SETUP] Refresh base repository")
+    _assert_base_repo_safe()
     run_cmd(["git", "fetch", "origin", "main"], verbose=True, retry=True)
+    _assert_base_repo_safe()
     done("Base repository refreshed")
+
+def _assert_base_repo_safe():
+    status = run_cmd(["git", "status", "--porcelain"], check=False)
+    if status.returncode != 0:
+        raise NeedsHumanError("could not inspect protected main checkout")
+    if status.stdout.strip():
+        raise NeedsHumanError(
+            "protected main checkout has uncommitted changes; refusing autonomous work"
+        )
+    ahead = run_cmd(
+        ["git", "rev-list", "--count", "origin/main..HEAD"],
+        check=False,
+    )
+    if ahead.returncode != 0:
+        raise NeedsHumanError("could not compare protected main checkout with origin/main")
+    try:
+        ahead_count = int(ahead.stdout.strip())
+    except ValueError as exc:
+        raise NeedsHumanError(
+            "could not parse protected main checkout divergence"
+        ) from exc
+    if ahead_count:
+        raise NeedsHumanError(
+            f"protected main checkout is ahead of origin/main by {ahead_count} commit(s); "
+            "refusing autonomous work"
+        )
 
 def _get_pr_checks(pr_url: str) -> list[dict] | None:
     result = run_cmd(

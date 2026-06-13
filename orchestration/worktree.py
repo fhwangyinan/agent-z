@@ -44,6 +44,8 @@ class WorktreeManager:
         resolved = Path(path).resolve()
         if not resolved.is_dir():
             raise RuntimeError(f"worktree does not exist: {resolved}")
+        if resolved == self.project_dir:
+            raise RuntimeError("task worktree cannot be the protected main checkout")
         result = subprocess.run(
             ["git", "rev-parse", "--is-inside-work-tree"],
             cwd=resolved,
@@ -54,6 +56,19 @@ class WorktreeManager:
         )
         if result.returncode != 0 or result.stdout.strip() != "true":
             raise RuntimeError(f"invalid worktree: {resolved}")
+        branch = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=resolved,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if branch.returncode != 0 or branch.stdout.strip() in {"", "main", "master"}:
+            raise RuntimeError(
+                f"task worktree is not on an isolated branch: "
+                f"{branch.stdout.strip() or '(detached)'}"
+            )
         return resolved
 
     def remove(self, path: str | Path):

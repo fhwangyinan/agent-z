@@ -38,12 +38,29 @@ class WorktreeManagerTests(unittest.TestCase):
             ["git", "worktree", "add", str(self.manager.path_for("run-1")), "agent-z/12-run-1"],
         )
 
-    @patch("orchestration.worktree.subprocess.run", return_value=result(stdout="true\n"))
+    @patch(
+        "orchestration.worktree.subprocess.run",
+        side_effect=[result(stdout="true\n"), result(stdout="agent-z/12-run-1\n")],
+    )
     def test_validate_accepts_git_worktree(self, execute):
         path = self.manager.path_for("run-1")
         path.mkdir()
         self.assertEqual(self.manager.validate(path), path)
-        self.assertEqual(execute.call_args.kwargs["errors"], "replace")
+        self.assertEqual(execute.call_args_list[0].kwargs["errors"], "replace")
+
+    def test_validate_rejects_protected_main_checkout(self):
+        with self.assertRaisesRegex(RuntimeError, "protected main checkout"):
+            self.manager.validate(self.project)
+
+    @patch(
+        "orchestration.worktree.subprocess.run",
+        side_effect=[result(stdout="true\n"), result(stdout="main\n")],
+    )
+    def test_validate_rejects_main_branch(self, execute):
+        path = self.manager.path_for("run-1")
+        path.mkdir()
+        with self.assertRaisesRegex(RuntimeError, "not on an isolated branch"):
+            self.manager.validate(path)
 
 
 if __name__ == "__main__":

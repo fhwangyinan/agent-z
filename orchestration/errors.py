@@ -4,3 +4,7 @@ class NeedsHumanError(RuntimeError):
 
 class NoChangesError(NeedsHumanError):
     """The run reached submission without a commit relative to the base branch."""
+
+
+class WorkspaceIsolationError(NeedsHumanError):
+    """An agent changed protected repository state outside its task worktree."""

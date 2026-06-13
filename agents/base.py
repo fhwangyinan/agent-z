@@ -6,6 +6,7 @@ import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
 
 from rich.console import Console
 from rich.markup import escape
@@ -23,6 +24,7 @@ from config import (
     OPENCODE_FLAGS,
     RETRY_TIMEOUT,
 )
+from orchestration.errors import WorkspaceIsolationError
 
 console = Console()
 
@@ -260,7 +262,75 @@ class Agent:
     def set_workspace(self, cwd: str):
         self.cwd = cwd
 
+    @staticmethod
+    def _git_value(cwd: str, *args: str) -> str | None:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    def _workspace_guard(self) -> tuple[str, str] | None:
+        workspace = Path(self.cwd).resolve()
+        project = Path(PROJECT_DIR).resolve()
+        if workspace == project:
+            return None
+        branch = self._git_value(str(workspace), "branch", "--show-current")
+        if not branch:
+            raise WorkspaceIsolationError(
+                f"workspace isolation violation: {workspace} is not on a named task branch"
+            )
+        if branch in {"main", "master"}:
+            raise WorkspaceIsolationError(
+                f"workspace isolation violation: task agent cannot run on protected branch {branch}"
+            )
+        project_head = self._git_value(str(project), "rev-parse", "HEAD")
+        if not project_head:
+            raise WorkspaceIsolationError(
+                "workspace isolation violation: could not snapshot protected repository HEAD"
+            )
+        return branch, project_head
+
+    def _guard_prompt(self, prompt: str, guard: tuple[str, str] | None) -> str:
+        if guard is None:
+            return prompt
+        branch, _ = guard
+        workspace = Path(self.cwd).resolve()
+        return (
+            "WORKSPACE BOUNDARY (mandatory):\n"
+            f"- Work only inside this task worktree: {workspace}\n"
+            f"- Stay on task branch: {branch}\n"
+            "- Never edit, commit, switch branches, or run git commands in the main checkout "
+            "or another worktree.\n"
+            "- Do not use cd or git -C to operate outside this task worktree.\n"
+            "- Push or create a PR only when the task explicitly asks for it.\n\n"
+            f"{prompt}"
+        )
+
+    def _verify_workspace_guard(self, guard: tuple[str, str] | None):
+        if guard is None:
+            return
+        branch, project_head = guard
+        current_branch = self._git_value(self.cwd, "branch", "--show-current")
+        if current_branch != branch:
+            raise WorkspaceIsolationError(
+                "workspace isolation violation: task worktree branch changed "
+                f"from {branch} to {current_branch or '(detached)'}"
+            )
+        current_project_head = self._git_value(PROJECT_DIR, "rev-parse", "HEAD")
+        if current_project_head != project_head:
+            raise WorkspaceIsolationError(
+                "workspace isolation violation: protected main checkout HEAD changed "
+                f"from {project_head[:12]} to {(current_project_head or 'unknown')[:12]}"
+            )
+
     def run(self, prompt: str, timeout: int = 600, resume_session: bool = False) -> str:
+        guard = self._workspace_guard()
+        prompt = self._guard_prompt(prompt, guard)
         session_id = self.session_id if resume_session else None
         mode = f"{self.runner.name}:{'resume' if session_id else 'new'}"
         started = time.monotonic()
@@ -276,6 +346,7 @@ class Agent:
                 cwd=self.cwd,
                 session_id=session_id,
             )
+        self._verify_workspace_guard(guard)
         self.session_id = result.session_id
         done(
             f"[{self.color}]{self.name}[/{self.color}] done "
