@@ -381,13 +381,44 @@ def show_run_detail(store: RunStore, run_id: str):
     console.print(timeline)
 
 
-def _service_table(services, selected_service: int | None = None) -> Table:
+def _service_activity(service, records: list[RunRecord], global_events) -> str:
+    process = getattr(service, "process", None)
+    pid = getattr(process, "pid", None)
+    for record in records:
+        if pid is not None and getattr(record, "owner_pid", None) == pid:
+            stage = STAGE_LABELS.get(record.stage, record.stage)
+            return f"#{record.issue_number} · {stage}"
+
+    name = str(getattr(service, "name", ""))
+    if name == "scheduler":
+        scheduler_events = [
+            event for event in global_events if event.event_type.startswith("scheduler_")
+        ]
+        if scheduler_events:
+            return scheduler_events[-1].message or scheduler_events[-1].event_type
+        return "waiting for first scan"
+    if name == "planner":
+        return "waiting for queued task"
+    if name.startswith("worker-"):
+        return "waiting for ready task"
+    if name == "reconciler":
+        return "waiting for expired lease"
+    return ""
+
+
+def _service_table(
+    services,
+    records: list[RunRecord],
+    global_events,
+    selected_service: int | None = None,
+) -> Table:
     table = Table(box=box.SIMPLE, expand=True, show_edge=False)
     table.add_column("", width=2)
-    table.add_column("Process")
-    table.add_column("PID", justify="right")
-    table.add_column("State")
-    table.add_column("Restarts", justify="right")
+    table.add_column("Process", width=12, no_wrap=True)
+    table.add_column("PID", justify="right", width=7)
+    table.add_column("State", width=12, no_wrap=True)
+    table.add_column("Activity", overflow="ellipsis", no_wrap=True)
+    table.add_column("R", justify="right", width=3)
     for index, service in enumerate(services):
         process = getattr(service, "process", None)
         returncode = process.poll() if process is not None else None
@@ -401,6 +432,7 @@ def _service_table(services, selected_service: int | None = None) -> Table:
             str(getattr(service, "name", "unknown")),
             str(getattr(process, "pid", "-")),
             state,
+            _service_activity(service, records, global_events),
             str(getattr(service, "restarts", 0)),
         )
     return table
@@ -428,9 +460,18 @@ def _dashboard_runs_table(records: list[RunRecord], selected: int) -> Table:
     return table
 
 
-def _dashboard_run_detail(store: RunStore, record: RunRecord | None, expanded: bool):
+def _dashboard_run_detail(
+    store: RunStore,
+    record: RunRecord | None,
+    expanded: bool,
+    *,
+    empty_message: str | None = None,
+):
     if record is None:
-        return Panel("[dim]No task selected[/dim]", title="Task detail", border_style="dim")
+        content = "[dim]No persisted tasks yet[/dim]"
+        if empty_message:
+            content += f"\n\n[bold]Scheduler[/bold]\n{escape(empty_message)}"
+        return Panel(content, title="Task detail", border_style="dim")
     lines = [
         f"[bold cyan]{record.run_id}[/bold cyan]  |  Issue #{record.issue_number}",
         f"{_status_text(record.status)}  |  {STAGE_LABELS.get(record.stage, record.stage)}",
@@ -498,6 +539,11 @@ def render_service_dashboard(
     notices: list[str] | None = None,
 ):
     records = store.list(limit=20)
+    global_events = [
+        event
+        for event in store.list_global_events(limit=50)
+        if not event.event_type.endswith("_idle")
+    ]
     if selected_run_id:
         for index, record in enumerate(records):
             if record.run_id == selected_run_id:
@@ -520,7 +566,12 @@ def render_service_dashboard(
         border_style="cyan",
     )
     service_panel = Panel(
-        _service_table(services, selected_service if focus == "processes" else None),
+        _service_table(
+            services,
+            records,
+            global_events,
+            selected_service if focus == "processes" else None,
+        ),
         title=f"Processes {'[focused]' if focus == 'processes' else ''}",
         border_style="bold blue" if focus == "processes" else "blue",
     )
@@ -532,13 +583,20 @@ def render_service_dashboard(
     detail_panel = (
         _tail_service_log(selected_process, expanded=expanded)
         if focus == "processes" and selected_process is not None
-        else _dashboard_run_detail(store, selected_record, expanded)
+        else _dashboard_run_detail(
+            store,
+            selected_record,
+            expanded,
+            empty_message=next(
+                (
+                    event.message or event.event_type
+                    for event in reversed(global_events)
+                    if event.event_type.startswith("scheduler_")
+                ),
+                None,
+            ),
+        )
     )
-    global_events = [
-        event
-        for event in store.list_global_events(limit=20)
-        if not event.event_type.endswith("_idle")
-    ]
     event_lines = [
         f"{event.event_type}: {event.message or ''}".rstrip()
         for event in global_events[-4:]

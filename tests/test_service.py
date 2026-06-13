@@ -41,6 +41,9 @@ class ServiceTests(unittest.TestCase):
         _spawn(service, max_parallel=4)
         self.assertEqual(popen.call_args.kwargs["env"]["MAX_PARALLEL_TASKS"], "4")
         self.assertEqual(popen.call_args.kwargs["env"]["AGENT_Z_QUIET_LIVE"], "1")
+        self.assertEqual(popen.call_args.kwargs["env"]["AGENT_Z_LOG_AGENT_STATUS"], "1")
+        self.assertEqual(popen.call_args.kwargs["env"]["PYTHONIOENCODING"], "utf-8")
+        self.assertEqual(popen.call_args.kwargs["env"]["PYTHONUNBUFFERED"], "1")
         self.assertIs(popen.call_args.kwargs["stderr"], __import__("subprocess").STDOUT)
         self.assertTrue(service.log_path.endswith("worker-1.log"))
 

@@ -417,6 +417,14 @@ def run_scheduler(*, once: bool = False, interval: int = SCHEDULER_IDLE_SLEEP) -
         style="blue",
     )
     while True:
+        scan_started = time.monotonic()
+        store.add_event(
+            None,
+            "scheduler_scan_started",
+            message="Scheduler scan started",
+            data={"pid": os.getpid(), "interval": interval},
+        )
+        log("Scheduler scan started")
         try:
             records = schedule_once(store, scheduler_agent=scheduler_agent)
         except Exception as exc:
@@ -442,6 +450,17 @@ def run_scheduler(*, once: bool = False, interval: int = SCHEDULER_IDLE_SLEEP) -
         total += len(records)
         for record in records:
             done(f"Scheduler enqueued issue #{record.issue_number} as run {record.run_id}")
+        scan_message = (
+            f"Scheduler scan completed: {len(records)} enqueued in "
+            f"{format_duration(time.monotonic() - scan_started)}"
+        )
+        store.add_event(
+            None,
+            "scheduler_scan_completed",
+            message=scan_message,
+            data={"pid": os.getpid(), "enqueued": len(records), "total_enqueued": total},
+        )
+        log(scan_message)
         if once:
             show_pool_status(
                 "Scheduler",

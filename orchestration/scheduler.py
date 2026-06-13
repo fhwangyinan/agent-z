@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Callable
 
-from agents.base import run_cmd
+from agents.base import log, run_cmd
 from agents.scheduler import SchedulerAgent, SchedulerDecision
 from config import (
     GITHUB_REPO,
@@ -308,6 +308,20 @@ def schedule_once(
         policy_state=policy_state,
     )
     if not candidates:
+        message = (
+            f"Scheduler found no eligible candidates among {len(issues)} open issue(s)"
+        )
+        store.add_event(
+            None,
+            "scheduler_no_candidates",
+            message=message,
+            data={
+                "open_issues": len(issues),
+                "active_issues": len(active_issue_numbers),
+                "open_pr_snapshot": open_pr_issue_numbers is not None,
+            },
+        )
+        log(message)
         store.save_scheduler_snapshot(
             GITHUB_REPO,
             candidate_state=candidate_state,
@@ -316,16 +330,20 @@ def schedule_once(
         )
         return []
     if trigger is None:
-        if snapshot.get("queue_state") != queue_state:
-            store.add_event(
-                None,
-                "scheduler_agent_skipped",
-                message="Scheduler Agent skipped because candidates are unchanged and queue supply is sufficient",
-                data={
-                    "candidate_issue_numbers": [candidate.issue_number for candidate in candidates],
-                    "queued": _queued_count(queue_state),
-                },
-            )
+        message = (
+            f"Scheduler Agent skipped: {len(candidates)} candidate(s) unchanged; "
+            f"{_queued_count(queue_state)} queued"
+        )
+        store.add_event(
+            None,
+            "scheduler_agent_skipped",
+            message=message,
+            data={
+                "candidate_issue_numbers": [candidate.issue_number for candidate in candidates],
+                "queued": _queued_count(queue_state),
+            },
+        )
+        log(message)
         store.save_scheduler_snapshot(
             GITHUB_REPO,
             candidate_state=candidate_state,
@@ -335,6 +353,18 @@ def schedule_once(
         return []
 
     scheduler_agent = scheduler_agent or SchedulerAgent()
+    candidate_numbers = [candidate.issue_number for candidate in candidates]
+    message = (
+        f"Scheduler Agent evaluating {len(candidates)} candidate(s): "
+        + ", ".join(f"#{number}" for number in candidate_numbers)
+    )
+    store.add_event(
+        None,
+        "scheduler_agent_started",
+        message=message,
+        data={"candidate_issue_numbers": candidate_numbers, "trigger": trigger},
+    )
+    log(message)
     selected, decisions = _selected_by_agent(candidates, scheduler_agent)
     selected_numbers = {candidate.issue_number for candidate, _ in selected}
     for decision in decisions:
@@ -364,6 +394,9 @@ def schedule_once(
                 for decision in decisions
             ],
         },
+    )
+    log(
+        f"Scheduler Agent selected {len(selected)} of {len(candidates)} candidate(s)"
     )
     enqueued = []
     available_slots = max(

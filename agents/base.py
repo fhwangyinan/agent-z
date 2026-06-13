@@ -264,6 +264,11 @@ class Agent:
         session_id = self.session_id if resume_session else None
         mode = f"{self.runner.name}:{'resume' if session_id else 'new'}"
         started = time.monotonic()
+        if os.environ.get("AGENT_Z_LOG_AGENT_STATUS") == "1":
+            log(
+                f"[{self.color}]{self.name}[/{self.color}] starting "
+                f"[dim]| {mode} | workspace:{self.cwd}[/dim]"
+            )
         with agent_status(self.name, mode):
             result = self.runner.execute(
                 prompt=prompt,

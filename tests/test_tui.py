@@ -68,7 +68,7 @@ class ServiceDashboardTests(unittest.TestCase):
             expanded=True,
             uptime=10,
         )
-        output = Console(file=io.StringIO(), record=True, width=120)
+        output = Console(file=io.StringIO(), record=True, width=160)
         output.print(dashboard)
         text = output.export_text()
         self.assertEqual(count, 1)
@@ -124,6 +124,60 @@ class ServiceDashboardTests(unittest.TestCase):
             text = output.export_text()
             self.assertIn("Process log", text)
             self.assertIn("latest line", text)
+
+    def test_dashboard_shows_process_current_issue_and_scheduler_activity(self):
+        planner_record = SimpleNamespace(
+            run_id="run-1", issue_number=42, status="planning", stage="analyzing",
+            created_at="2026-01-01T00:00:00+00:00", pr_url=None, error=None,
+            branch=None, lease_role="planner", lease_expires_at=None,
+            worktree_path=None, owner_pid=101,
+        )
+        store = Mock()
+        store.list.return_value = [planner_record]
+        store.list_global_events.return_value = [
+            SimpleNamespace(
+                event_type="scheduler_agent_started",
+                message="Scheduler Agent evaluating 3 candidate(s): #1, #2, #3",
+            ),
+        ]
+        scheduler_process = Mock(pid=100)
+        scheduler_process.poll.return_value = None
+        planner_process = Mock(pid=101)
+        planner_process.poll.return_value = None
+        services = [
+            SimpleNamespace(name="scheduler", process=scheduler_process, restarts=0),
+            SimpleNamespace(name="planner", process=planner_process, restarts=0),
+        ]
+
+        dashboard, _ = render_service_dashboard(store, services)
+
+        output = Console(file=io.StringIO(), record=True, width=160)
+        output.print(dashboard)
+        text = output.export_text()
+        self.assertIn("Activity", text)
+        self.assertIn("#42", text)
+        self.assertIn("evaluating 3", text)
+
+    def test_dashboard_shows_scheduler_activity_before_first_task(self):
+        store = Mock()
+        store.list.return_value = []
+        store.list_global_events.return_value = [
+            SimpleNamespace(
+                event_type="scheduler_scan_started",
+                message="Scheduler scan started",
+            ),
+        ]
+        process = Mock(pid=100)
+        process.poll.return_value = None
+        service = SimpleNamespace(name="scheduler", process=process, restarts=0)
+
+        dashboard, _ = render_service_dashboard(store, [service])
+
+        output = Console(file=io.StringIO(), record=True, width=120)
+        output.print(dashboard)
+        text = output.export_text()
+        self.assertIn("No persisted tasks yet", text)
+        self.assertIn("Scheduler scan started", text)
 
 
 if __name__ == "__main__":

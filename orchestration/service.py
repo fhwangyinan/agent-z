@@ -71,6 +71,9 @@ def _spawn(service: ServiceProcess, *, max_parallel: int) -> subprocess.Popen:
     environment["MAX_PARALLEL_TASKS"] = str(max_parallel)
     environment["AGENT_Z_QUIET_IDLE"] = "1"
     environment["AGENT_Z_QUIET_LIVE"] = "1"
+    environment["AGENT_Z_LOG_AGENT_STATUS"] = "1"
+    environment["PYTHONIOENCODING"] = "utf-8"
+    environment["PYTHONUNBUFFERED"] = "1"
     logs = Path(STATE_DB).resolve().parent / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     if service.log_handle is not None:
@@ -86,6 +89,11 @@ def _spawn(service: ServiceProcess, *, max_parallel: int) -> subprocess.Popen:
                 source.replace(log_path.with_name(f"{log_path.name}.{index + 1}"))
         log_path.replace(log_path.with_name(f"{log_path.name}.1"))
     service.log_handle = open(service.log_path, "ab", buffering=0)
+    service.log_handle.write(
+        f"\n--- {time.strftime('%Y-%m-%d %H:%M:%S')} starting {service.name} ---\n".encode(
+            "utf-8"
+        )
+    )
     kwargs = {
         "env": environment,
         "stdout": service.log_handle,

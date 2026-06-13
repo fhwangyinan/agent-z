@@ -207,7 +207,11 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertEqual([record.issue_number for record in records], [2])
         store.enqueue.assert_called_once_with(ANY, 2)
-        evaluation = store.add_event.call_args_list[0]
+        evaluation = next(
+            call
+            for call in store.add_event.call_args_list
+            if call.args[1] == "scheduler_agent_evaluated"
+        )
         self.assertEqual(evaluation.args[1], "scheduler_agent_evaluated")
         self.assertEqual(evaluation.kwargs["data"]["selected_issue_numbers"], [2])
         self.assertEqual(evaluation.kwargs["data"]["trigger"], "initial_scan")
@@ -279,7 +283,8 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(schedule_once(store, scheduler_agent=agent), [])
 
         agent.rank.assert_not_called()
-        store.add_event.assert_not_called()
+        event_types = [call.args[1] for call in store.add_event.call_args_list]
+        self.assertEqual(event_types, ["scheduler_agent_skipped"])
         store.save_scheduler_snapshot.assert_called_once()
 
     @patch("orchestration.scheduler._open_pr_issue_numbers", return_value=set())
