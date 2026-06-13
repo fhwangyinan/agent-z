@@ -101,7 +101,8 @@ class ClaudeRunnerTests(unittest.TestCase):
 
 
 class RunnerOutputDecodingTests(unittest.TestCase):
-    def test_decodes_windows_gbk_error_output(self):
+    @patch("agents.runners.base.locale.getpreferredencoding", return_value="UTF-8")
+    def test_decodes_windows_gbk_error_output_on_utf8_host(self, _preferred_encoding):
         self.assertEqual(decode_subprocess_output("命令行太长".encode("gbk")), "命令行太长")
 
 
