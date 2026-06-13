@@ -1,4 +1,5 @@
 import subprocess
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -41,6 +42,23 @@ class QuietRunTest(unittest.TestCase):
                 patcher = patch(f"{module}.{name}")
                 patcher.start()
                 self.addCleanup(patcher.stop)
+
+
+class LeaseTests(unittest.TestCase):
+    def test_maintain_lease_propagates_lost_ownership(self):
+        attempted = threading.Event()
+        store = Mock()
+
+        def lose_ownership(*args):
+            attempted.set()
+            raise RuntimeError("run is no longer owned by worker")
+
+        store.heartbeat.side_effect = lose_ownership
+        with self.assertRaisesRegex(RuntimeError, "no longer owned"):
+            with orchestration.pools.maintain_lease(
+                store, "run-1", "worker", 30, interval=0.001
+            ):
+                self.assertTrue(attempted.wait(1))
 
 
 class TuiFormattingTests(QuietRunTest):

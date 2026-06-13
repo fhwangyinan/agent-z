@@ -61,13 +61,16 @@ def maintain_lease(
     interval: float | None = None,
 ):
     stop = threading.Event()
+    heartbeat_errors: list[RuntimeError] = []
     refresh_interval = interval or max(1.0, min(30.0, lease_seconds / 3))
 
     def refresh():
         while not stop.wait(refresh_interval):
             try:
                 store.heartbeat(run_id, role, lease_seconds)
-            except RuntimeError:
+            except RuntimeError as exc:
+                heartbeat_errors.append(exc)
+                stop.set()
                 return
             except Exception as exc:
                 store.add_event(
@@ -88,6 +91,8 @@ def maintain_lease(
     finally:
         stop.set()
         thread.join(timeout=max(1.0, refresh_interval + 1))
+    if heartbeat_errors:
+        raise heartbeat_errors[0]
 
 
 def cancel_run(store: RunStore, worktrees: WorktreeManager, run_id: str):
@@ -176,10 +181,7 @@ def run_worker(*, max_runs: int = 0, idle_sleep: int = WORKER_IDLE_SLEEP) -> int
             current = store.get(record.run_id)
             event_type = "worker_run_failed"
             error_msg = str(exc)
-            is_network_err = any(
-                p in error_msg.lower()
-                for p in ("eof", "timeout", "connection", "network", "unreachable", "refused", "reset", "broken pipe", "temporary failure")
-            )
+            is_network_err = _is_transient_error(exc)
             if current.stage == "ready" and "file lock conflict" in error_msg.lower():
                 store.update(
                     record.run_id,

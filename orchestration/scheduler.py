@@ -286,7 +286,7 @@ def schedule_once(
     eligible_issue_numbers = {
         int(number)
         for number, state in candidate_state.items()
-        if not state.get("open_pr")
+        if open_pr_issue_numbers is None or not state.get("open_pr")
     }
     for issue_number, queued in scheduler_queued.items():
         if (

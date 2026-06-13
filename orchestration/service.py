@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +26,8 @@ from config import (
 from orchestration.github_ops import validate_environment
 from orchestration.store import RunStore
 from orchestration.tui import console, render_service_dashboard
+
+MAX_SERVICE_NOTICES = 200
 
 
 @dataclass
@@ -196,9 +199,10 @@ def run_service(
         force=force,
         keep_worktree=keep_worktree,
     )
-    notices = [
-        f"Starting Scheduler, Planner, {workers} Worker(s), and Reconciler"
-    ]
+    notices = deque(
+        [f"Starting Scheduler, Planner, {workers} Worker(s), and Reconciler"],
+        maxlen=MAX_SERVICE_NOTICES,
+    )
     selected = 0
     selected_run_id = None
     selected_service = 0
@@ -237,7 +241,7 @@ def run_service(
                         focus=focus,
                         expanded=expanded,
                         uptime=time.monotonic() - started,
-                        notices=notices,
+                        notices=list(notices),
                     )
                     live.update(dashboard)
                     key = key_reader()
@@ -303,7 +307,7 @@ def run_service(
                                 focus=focus,
                                 expanded=expanded,
                                 uptime=time.monotonic() - started,
-                                notices=notices + [
+                                notices=list(notices) + [
                                     f"Restarting {service.name} in "
                                     f"{max(0, int(deadline - time.monotonic() + 0.999))}s"
                                 ],

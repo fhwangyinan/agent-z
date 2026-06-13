@@ -342,6 +342,26 @@ class SchedulerTests(unittest.TestCase):
         saved = store.save_scheduler_snapshot.call_args.kwargs
         self.assertEqual(saved["policy_state"], _policy_state())
 
+    @patch("orchestration.scheduler._open_pr_issue_numbers", return_value=None)
+    @patch("orchestration.scheduler._issue_is_open", return_value=False)
+    @patch("orchestration.scheduler._list_open_issues")
+    def test_schedule_once_keeps_scheduler_queue_when_pr_snapshot_fails(
+        self, list_issues, issue_is_open, open_pr_issues
+    ):
+        list_issues.return_value = [
+            {"number": 1, "title": "Actionable", "body": "", "labels": []},
+        ]
+        queued = SimpleNamespace(run_id="scheduled-1", issue_number=1)
+        store = Mock()
+        store.list_scheduler_queued.return_value = [queued]
+        store.active_issue_numbers.return_value = {1}
+        store.scheduler_queue_state.return_value = {"1": "queued"}
+        store.get_scheduler_snapshot.return_value = None
+
+        self.assertEqual(schedule_once(store, scheduler_agent=Mock()), [])
+
+        store.release_scheduler_queued.assert_not_called()
+
     @patch("orchestration.scheduler.run_cmd")
     def test_bulk_open_pr_query_extracts_exact_issue_references(self, run_cmd):
         run_cmd.return_value = SimpleNamespace(
