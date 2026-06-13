@@ -25,6 +25,25 @@ def _verify_pr_url(pr_url: str) -> str:
         return ""
     return str(data.get("url", ""))
 
+def _get_pr_snapshot(pr_url: str | None) -> dict | None:
+    if not pr_url:
+        return None
+    result = run_cmd(
+        [
+            "gh", "pr", "view", pr_url,
+            "--repo", GITHUB_REPO,
+            "--json", "url,state,mergedAt",
+        ],
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
 def _find_open_pr_for_branch(branch: str | None) -> str:
     if not branch:
         return ""

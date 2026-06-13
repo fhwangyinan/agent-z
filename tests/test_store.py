@@ -130,6 +130,43 @@ class RunStoreTests(unittest.TestCase):
         self.assertEqual(reconciled[0].status, "needs_human")
         self.assertEqual(reconciled[0].stage, "ready")
 
+    @patch("orchestration.store._pid_alive", return_value=False)
+    def test_reconciler_immediately_requeues_dead_planner_owner(self, pid_alive):
+        queued = self.store.enqueue("owner/repo", 1)
+        planning = self.store.claim_for_planning(3600, queued.run_id)
+
+        recovered = self.store.reconcile_dead_owners()
+
+        self.assertEqual(recovered[0].status, "queued")
+        self.assertEqual(recovered[0].stage, "queued")
+        self.assertIsNone(recovered[0].owner_pid)
+        self.assertEqual(
+            self.store.list_events(planning.run_id)[-1].event_type,
+            "dead_owner_recovered",
+        )
+
+    @patch("orchestration.store._pid_alive", return_value=False)
+    def test_reconciler_releases_dead_worker_at_checkpoint(self, pid_alive):
+        queued = self.store.enqueue("owner/repo", 1)
+        self.store.claim_for_planning(60, queued.run_id)
+        self.store.finish_planning(queued.run_id, plan={}, risk="low")
+        running = self.store.claim_ready(max_parallel=1, lease_seconds=3600)
+        self.store.update(running.run_id, stage="submitting")
+
+        recovered = self.store.reconcile_dead_owners()
+
+        self.assertEqual(recovered[0].status, "ready")
+        self.assertEqual(recovered[0].stage, "submitting")
+        self.assertIsNone(recovered[0].owner_pid)
+
+    @patch("orchestration.store._pid_alive", return_value=True)
+    def test_reconciler_leaves_live_owner_untouched(self, pid_alive):
+        queued = self.store.enqueue("owner/repo", 1)
+        self.store.claim_for_planning(3600, queued.run_id)
+
+        self.assertEqual(self.store.reconcile_dead_owners(), [])
+        self.assertEqual(self.store.get(queued.run_id).status, "planning")
+
     def test_heartbeat_atomically_requires_an_active_owned_lease(self):
         queued = self.store.enqueue("owner/repo", 1)
         planning = self.store.claim_for_planning(60, queued.run_id)
@@ -151,6 +188,19 @@ class RunStoreTests(unittest.TestCase):
             branch="agent-z/1-run",
         )
         candidates = self.store.list_submission_recovery_candidates()
+        self.assertEqual([candidate.run_id for candidate in candidates], [run.run_id])
+
+    def test_lists_nonactive_runs_with_prs_for_recovery(self):
+        run = self.store.create("owner/repo", 1, max_parallel=1)
+        self.store.update(
+            run.run_id,
+            status="needs_human",
+            stage="waiting_checks",
+            pr_url="https://example/pr/1",
+        )
+
+        candidates = self.store.list_pr_recovery_candidates()
+
         self.assertEqual([candidate.run_id for candidate in candidates], [run.run_id])
 
     def test_queued_issue_is_locked(self):

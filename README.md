@@ -90,8 +90,10 @@ flowchart LR
    independent Reviewer sends findings back for fixes.
 6. **Deliver**: a deterministic Coordinator commits, pushes, opens the PR,
    watches checks, and loops on actionable feedback.
-7. **Recover**: the Reconciler requeues expired planning leases and quarantines
-   abandoned development as `needs_human`.
+7. **Recover**: the Reconciler immediately releases dead process owners, resumes
+   Worker checkpoints, adopts externally created PRs, and completes runs whose
+   PRs were already merged. Ambiguous expired development is still quarantined
+   as `needs_human`.
 
 The Scheduler Agent is called only when the candidate snapshot changes or the
 queue needs replenishment. Open PRs are fetched once per scan, reducing API

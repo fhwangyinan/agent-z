@@ -1034,7 +1034,9 @@ class ReconcilerTests(QuietRunTest):
             branch="agent-z/1-run",
         )
         store = Mock()
+        store.reconcile_dead_owners.return_value = []
         store.reconcile_expired.return_value = []
+        store.list_pr_recovery_candidates.return_value = []
         store.list_submission_recovery_candidates.return_value = [record]
         store_class.return_value = store
         self.assertEqual(run.run_reconciler(once=True, interval=1), 1)
@@ -1060,7 +1062,9 @@ class ReconcilerTests(QuietRunTest):
             worktree_path="worktree",
         )
         store = Mock()
+        store.reconcile_dead_owners.return_value = []
         store.reconcile_expired.return_value = []
+        store.list_pr_recovery_candidates.return_value = []
         store.list_submission_recovery_candidates.return_value = [record]
         store.count_events.return_value = 0
         store_class.return_value = store
@@ -1076,6 +1080,37 @@ class ReconcilerTests(QuietRunTest):
         self.assertEqual(
             store.add_event.call_args_list[-1].args[1],
             "submission_no_changes_retry",
+        )
+
+    @patch(
+        "orchestration.pools._get_pr_snapshot",
+        return_value={
+            "url": "https://example/pr/1",
+            "state": "MERGED",
+            "mergedAt": "2026-06-13T00:00:00Z",
+        },
+    )
+    @patch("orchestration.pools.RunStore")
+    def test_reconciler_completes_run_with_merged_pr(self, store_class, get_pr):
+        record = SimpleNamespace(run_id="run-1", pr_url="https://example/pr/1")
+        store = Mock()
+        store.reconcile_dead_owners.return_value = []
+        store.reconcile_expired.return_value = []
+        store.list_pr_recovery_candidates.return_value = [record]
+        store.list_submission_recovery_candidates.return_value = []
+        store_class.return_value = store
+
+        self.assertEqual(run.run_reconciler(once=True, interval=1), 1)
+
+        store.update.assert_called_once_with(
+            "run-1",
+            status="completed",
+            stage="completed",
+            error=None,
+        )
+        self.assertEqual(
+            store.add_event.call_args_list[-1].args[1],
+            "merged_pr_reconciled",
         )
 
 

@@ -24,7 +24,11 @@ from config import (
 )
 from orchestration.github_ops import cleanup_run_artifacts, validate_environment
 from orchestration.scheduler import schedule_once
-from orchestration.submission import _find_open_pr_for_branch, branch_has_commits
+from orchestration.submission import (
+    _find_open_pr_for_branch,
+    _get_pr_snapshot,
+    branch_has_commits,
+)
 from orchestration.store import RunStore
 from orchestration.tui import show_banner, show_pool_status, wait_with_status
 from orchestration.workflow import _build_agents, execute_task, plan_task
@@ -492,6 +496,13 @@ def run_reconciler(*, once: bool = False, interval: int = RECONCILER_INTERVAL) -
         style="magenta",
     )
     while True:
+        dead_owner_recoveries = store.reconcile_dead_owners()
+        total += len(dead_owner_recoveries)
+        for record in dead_owner_recoveries:
+            warn(
+                f"Recovered dead owner for {record.run_id}: "
+                f"status={record.status} stage={record.stage}"
+            )
         reconciled = store.reconcile_expired()
         total += len(reconciled)
         for record in reconciled:
@@ -499,6 +510,29 @@ def run_reconciler(*, once: bool = False, interval: int = RECONCILER_INTERVAL) -
                 f"Reconciled expired {record.run_id}: "
                 f"status={record.status} stage={record.stage}"
             )
+        for record in store.list_pr_recovery_candidates():
+            snapshot = _get_pr_snapshot(record.pr_url)
+            if not snapshot or str(snapshot.get("state", "")).upper() != "MERGED":
+                continue
+            store.update(
+                record.run_id,
+                status="completed",
+                stage="completed",
+                error=None,
+            )
+            store.add_event(
+                record.run_id,
+                "merged_pr_reconciled",
+                stage="completed",
+                status="completed",
+                message="Recovered run from already merged PR",
+                data={
+                    "pr_url": snapshot.get("url") or record.pr_url,
+                    "merged_at": snapshot.get("mergedAt"),
+                },
+            )
+            done(f"Completed recovered run {record.run_id}: PR already merged")
+            total += 1
         for record in store.list_submission_recovery_candidates():
             pr_url = _find_open_pr_for_branch(record.branch)
             if pr_url:

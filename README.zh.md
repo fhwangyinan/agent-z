@@ -82,7 +82,9 @@ flowchart LR
 4. **隔离执行**：Worker 领取 Issue 与模块资源，并创建专属分支和 worktree。
 5. **开发与审查**：Task Lead 延续规划上下文完成开发；独立 Reviewer 将发现反馈给 Developer。
 6. **提交交付**：确定性 Coordinator commit、push、创建 PR、等待 checks，并循环处理有效反馈。
-7. **故障恢复**：Reconciler 重新排队过期规划租约，并把废弃开发标记为 `needs_human`。
+7. **故障恢复**：Reconciler 会立即释放已死亡进程持有的任务，从 Worker checkpoint
+   继续执行，接管外部创建的 PR，并自动收敛 PR 已合并的任务。无法确定是否安全的
+   过期开发任务仍会进入 `needs_human`。
 
 只有候选快照变化或队列需要补位时才会调用 Scheduler Agent。每轮只批量获取一次
 open PR，降低 GitHub API 请求与 Agent token 消耗。

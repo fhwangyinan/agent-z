@@ -550,6 +550,58 @@ class RunStore:
                 reconciled.append(current.run_id)
         return [self.get(run_id) for run_id in reconciled]
 
+    def reconcile_dead_owners(self) -> list[RunRecord]:
+        """Immediately release active runs whose recorded owner process is gone."""
+        recovered: list[str] = []
+        now = _now()
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                """
+                SELECT * FROM runs
+                WHERE owner_pid IS NOT NULL
+                  AND status IN ('planning', 'running', 'waiting_checks')
+                ORDER BY updated_at
+                """
+            ).fetchall()
+            for row in rows:
+                current = self._record(row)
+                if _pid_alive(current.owner_pid):
+                    continue
+                if current.status == "planning":
+                    status, stage = "queued", "queued"
+                    message = f"planner owner process {current.owner_pid} exited; requeued"
+                else:
+                    status, stage = "ready", current.stage
+                    message = (
+                        f"{current.lease_role or 'worker'} owner process "
+                        f"{current.owner_pid} exited; released for checkpoint resume"
+                    )
+                connection.execute(
+                    """
+                    UPDATE runs
+                    SET status = ?, stage = ?, owner_pid = NULL, lease_role = NULL,
+                        lease_expires_at = NULL, error = NULL, updated_at = ?
+                    WHERE run_id = ?
+                    """,
+                    (status, stage, now, current.run_id),
+                )
+                self._insert_event(
+                    connection,
+                    run_id=current.run_id,
+                    event_type="dead_owner_recovered",
+                    stage=stage,
+                    status=status,
+                    message=message,
+                    data={
+                        "previous_status": current.status,
+                        "previous_owner_pid": current.owner_pid,
+                        "resume_stage": stage,
+                    },
+                )
+                recovered.append(current.run_id)
+        return [self.get(run_id) for run_id in recovered]
+
     def get(self, run_id: str) -> RunRecord:
         with self._connect() as connection:
             row = connection.execute(
@@ -727,6 +779,18 @@ class RunStore:
                   AND stage = 'submitting'
                   AND worktree_path IS NOT NULL
                   AND branch IS NOT NULL
+                ORDER BY updated_at
+                """
+            ).fetchall()
+        return [self._record(row) for row in rows]
+
+    def list_pr_recovery_candidates(self) -> list[RunRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM runs
+                WHERE status IN ('ready', 'failed', 'needs_human')
+                  AND pr_url IS NOT NULL
                 ORDER BY updated_at
                 """
             ).fetchall()
