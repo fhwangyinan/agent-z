@@ -507,6 +507,51 @@ class SubmissionRecoveryTests(QuietRunTest):
         developer.prepare_submission.assert_not_called()
         self.assertEqual(store.add_event.call_args.args[1], "submission_metadata_reused")
 
+    @patch("orchestration.submission._issue_title_for_pr", return_value="Issue title")
+    def test_submission_metadata_is_generated_from_plan_without_agent_call(self, issue_title):
+        record = SimpleNamespace(
+            issue_number=7,
+            run_id="run-1",
+            stage="submitting",
+            status="running",
+            plan={"summary": "Implement the fix.", "test_plan": ["Run unit tests"]},
+        )
+        store = Mock()
+        store.list_events.return_value = []
+        developer = Mock()
+
+        metadata = orchestration.submission._prepare_submission_metadata(record, developer, store)
+
+        developer.prepare_submission.assert_not_called()
+        self.assertEqual(metadata["pr_title"], "Issue title")
+        self.assertIn("Implement the fix.", metadata["pr_body"])
+        self.assertIn("- Run unit tests", metadata["pr_body"])
+        self.assertEqual(store.add_event.call_args.kwargs["data"]["source"], "deterministic")
+
+    @patch("orchestration.submission.SUBMISSION_USE_AGENT_METADATA", True)
+    def test_submission_metadata_can_use_agent_when_enabled(self):
+        record = SimpleNamespace(
+            issue_number=7,
+            run_id="run-1",
+            stage="submitting",
+            status="running",
+            plan={},
+        )
+        store = Mock()
+        store.list_events.return_value = []
+        developer = Mock(session_id="session")
+        developer.prepare_submission.return_value = {
+            "commit_message": "fix: generated",
+            "pr_title": "Generated title",
+            "pr_body": "Generated body",
+        }
+
+        metadata = orchestration.submission._prepare_submission_metadata(record, developer, store)
+
+        developer.prepare_submission.assert_called_once()
+        self.assertEqual(metadata["commit_message"], "fix: generated")
+        self.assertEqual(store.add_event.call_args.kwargs["data"]["source"], "agent")
+
     @patch("orchestration.workflow.SUBMISSION_NO_CHANGES_MAX_RETRIES", 1)
     @patch(
         "orchestration.workflow.resolve_submission",

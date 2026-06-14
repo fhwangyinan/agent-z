@@ -30,7 +30,7 @@ DEPENDENCY_PATTERN = re.compile(
     r"((?:#\d+)(?:\s*(?:,|and)\s*#\d+)*)"
 )
 ISSUE_NUMBER_PATTERN = re.compile(r"#(\d+)")
-SCHEDULER_POLICY_VERSION = 1
+SCHEDULER_POLICY_VERSION = 2
 
 
 @dataclass(frozen=True)
@@ -220,6 +220,51 @@ def _queued_count(queue_state: dict[str, str]) -> int:
     return sum(status == "queued" for status in queue_state.values())
 
 
+def _candidates_for_agent(
+    candidates: list[ScheduleCandidate],
+    snapshot: dict | None,
+    trigger: str,
+) -> tuple[list[ScheduleCandidate], int]:
+    if snapshot is None or trigger in {"initial_scan", "policy_changed"}:
+        return candidates, 0
+    previous_candidates = snapshot.get("candidate_state") or {}
+    decisions = snapshot.get("decision_state") or {}
+    selected = []
+    cached_rejects = 0
+    for candidate in candidates:
+        key = str(candidate.issue_number)
+        changed = previous_candidates.get(key) != {
+            "updated_at": candidate.updated_at,
+            "open_pr": False,
+        }
+        cached_action = (decisions.get(key) or {}).get("action")
+        if changed or cached_action in {None, "defer"}:
+            selected.append(candidate)
+        elif cached_action == "reject":
+            cached_rejects += 1
+    return selected, cached_rejects
+
+
+def _merged_decision_state(
+    candidates: list[ScheduleCandidate],
+    previous: dict | None,
+    decisions: list[SchedulerDecision],
+) -> dict[str, dict]:
+    candidate_numbers = {str(candidate.issue_number) for candidate in candidates}
+    merged = {
+        str(number): value
+        for number, value in (previous or {}).items()
+        if str(number) in candidate_numbers
+    }
+    for decision in decisions:
+        merged[str(decision.issue_number)] = {
+            "action": decision.action,
+            "score": decision.score,
+            "reason": decision.reason,
+        }
+    return merged
+
+
 def _policy_state() -> dict:
     return {
         "version": SCHEDULER_POLICY_VERSION,
@@ -315,6 +360,7 @@ def schedule_once(
             )
     queue_state = store.scheduler_queue_state(GITHUB_REPO)
     snapshot = store.get_scheduler_snapshot(GITHUB_REPO)
+    decision_state = (snapshot or {}).get("decision_state") or {}
     policy_state = _policy_state()
     trigger = _agent_trigger(
         snapshot,
@@ -342,6 +388,7 @@ def schedule_once(
             candidate_state=candidate_state,
             queue_state=queue_state,
             policy_state=policy_state,
+            decision_state={},
         )
         return []
     if trigger is None:
@@ -364,23 +411,53 @@ def schedule_once(
             candidate_state=candidate_state,
             queue_state=queue_state,
             policy_state=policy_state,
+            decision_state=_merged_decision_state(candidates, decision_state, []),
+        )
+        return []
+
+    agent_candidates, cached_rejects = _candidates_for_agent(candidates, snapshot, trigger)
+    if not agent_candidates:
+        message = (
+            f"Scheduler Agent skipped: {cached_rejects} unchanged rejected candidate(s) "
+            "served from decision cache"
+        )
+        store.add_event(
+            None,
+            "scheduler_agent_cache_hit",
+            message=message,
+            data={"cached_rejects": cached_rejects, "trigger": trigger},
+        )
+        log(message)
+        store.save_scheduler_snapshot(
+            GITHUB_REPO,
+            candidate_state=candidate_state,
+            queue_state=queue_state,
+            policy_state=policy_state,
+            decision_state=_merged_decision_state(candidates, decision_state, []),
+            agent_evaluated=True,
         )
         return []
 
     scheduler_agent = scheduler_agent or SchedulerAgent()
-    candidate_numbers = [candidate.issue_number for candidate in candidates]
+    candidate_numbers = [candidate.issue_number for candidate in agent_candidates]
     message = (
-        f"Scheduler Agent evaluating {len(candidates)} candidate(s): "
+        f"Scheduler Agent evaluating {len(agent_candidates)} candidate(s)"
+        f" ({cached_rejects} cached reject(s)): "
         + ", ".join(f"#{number}" for number in candidate_numbers)
     )
     store.add_event(
         None,
         "scheduler_agent_started",
         message=message,
-        data={"candidate_issue_numbers": candidate_numbers, "trigger": trigger},
+        data={
+            "candidate_issue_numbers": candidate_numbers,
+            "cached_rejects": cached_rejects,
+            "trigger": trigger,
+        },
     )
     log(message)
-    selected, decisions = _selected_by_agent(candidates, scheduler_agent)
+    selected, decisions = _selected_by_agent(agent_candidates, scheduler_agent)
+    decision_state = _merged_decision_state(candidates, decision_state, decisions)
     selected_numbers = {candidate.issue_number for candidate, _ in selected}
     for decision in decisions:
         queued = scheduler_queued.get(decision.issue_number)
@@ -394,9 +471,10 @@ def schedule_once(
     store.add_event(
         None,
         "scheduler_agent_evaluated",
-        message=f"Scheduler Agent selected {len(selected)} of {len(candidates)} candidates",
+        message=f"Scheduler Agent selected {len(selected)} of {len(agent_candidates)} candidates",
         data={
-            "candidate_issue_numbers": [candidate.issue_number for candidate in candidates],
+            "candidate_issue_numbers": candidate_numbers,
+            "cached_rejects": cached_rejects,
             "selected_issue_numbers": sorted(selected_numbers),
             "trigger": trigger,
             "decisions": [
@@ -411,7 +489,7 @@ def schedule_once(
         },
     )
     log(
-        f"Scheduler Agent selected {len(selected)} of {len(candidates)} candidate(s)"
+        f"Scheduler Agent selected {len(selected)} of {len(agent_candidates)} candidate(s)"
     )
     enqueued = []
     available_slots = max(
@@ -451,6 +529,7 @@ def schedule_once(
         candidate_state=candidate_state,
         queue_state=store.scheduler_queue_state(GITHUB_REPO),
         policy_state=policy_state,
+        decision_state=decision_state,
         agent_evaluated=True,
     )
     return enqueued

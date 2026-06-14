@@ -148,6 +148,7 @@ class RunStore:
                     candidate_state TEXT NOT NULL DEFAULT '{}',
                     queue_state TEXT NOT NULL DEFAULT '{}',
                     policy_state TEXT NOT NULL DEFAULT '{}',
+                    decision_state TEXT NOT NULL DEFAULT '{}',
                     agent_evaluated_at TEXT,
                     updated_at TEXT NOT NULL
                 )
@@ -199,6 +200,11 @@ class RunStore:
             if "agent_evaluated_at" not in snapshot_columns:
                 connection.execute(
                     "ALTER TABLE scheduler_snapshots ADD COLUMN agent_evaluated_at TEXT"
+                )
+            if "decision_state" not in snapshot_columns:
+                connection.execute(
+                    "ALTER TABLE scheduler_snapshots "
+                    "ADD COLUMN decision_state TEXT NOT NULL DEFAULT '{}'"
                 )
 
     @staticmethod
@@ -652,7 +658,7 @@ class RunStore:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT candidate_state, queue_state, policy_state,
+                SELECT candidate_state, queue_state, policy_state, decision_state,
                        agent_evaluated_at, updated_at
                 FROM scheduler_snapshots WHERE repo = ?
                 """,
@@ -664,6 +670,7 @@ class RunStore:
             "candidate_state": json.loads(row["candidate_state"] or "{}"),
             "queue_state": json.loads(row["queue_state"] or "{}"),
             "policy_state": json.loads(row["policy_state"] or "{}"),
+            "decision_state": json.loads(row["decision_state"] or "{}"),
             "agent_evaluated_at": row["agent_evaluated_at"],
             "updated_at": row["updated_at"],
         }
@@ -675,6 +682,7 @@ class RunStore:
         candidate_state: dict,
         queue_state: dict,
         policy_state: dict | None = None,
+        decision_state: dict | None = None,
         agent_evaluated: bool = False,
     ):
         agent_evaluated_at = _now() if agent_evaluated else None
@@ -682,14 +690,15 @@ class RunStore:
             connection.execute(
                 """
                 INSERT INTO scheduler_snapshots (
-                    repo, candidate_state, queue_state, policy_state,
+                    repo, candidate_state, queue_state, policy_state, decision_state,
                     agent_evaluated_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, COALESCE(?, '{}'), ?, ?)
                 ON CONFLICT(repo) DO UPDATE SET
                     candidate_state = excluded.candidate_state,
                     queue_state = excluded.queue_state,
                     policy_state = excluded.policy_state,
+                    decision_state = COALESCE(?, scheduler_snapshots.decision_state),
                     agent_evaluated_at = COALESCE(
                         excluded.agent_evaluated_at,
                         scheduler_snapshots.agent_evaluated_at
@@ -701,8 +710,16 @@ class RunStore:
                     json.dumps(candidate_state, sort_keys=True),
                     json.dumps(queue_state, sort_keys=True),
                     json.dumps(policy_state or {}, sort_keys=True),
+                    (
+                        json.dumps(decision_state, sort_keys=True)
+                        if decision_state is not None else None
+                    ),
                     agent_evaluated_at,
                     _now(),
+                    (
+                        json.dumps(decision_state, sort_keys=True)
+                        if decision_state is not None else None
+                    ),
                 ),
             )
 

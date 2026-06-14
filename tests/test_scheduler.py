@@ -349,6 +349,83 @@ class SchedulerTests(unittest.TestCase):
     @patch("orchestration.scheduler._open_pr_issue_numbers", return_value=set())
     @patch("orchestration.scheduler._issue_is_open", return_value=False)
     @patch("orchestration.scheduler._list_open_issues")
+    def test_empty_queue_reassessment_only_sends_deferred_and_changed_candidates(
+        self, list_issues, issue_is_open, open_pr_issues
+    ):
+        list_issues.return_value = [
+            {"number": 1, "title": "Tracking", "body": "", "labels": [], "updatedAt": "same"},
+            {"number": 2, "title": "Maybe later", "body": "", "labels": [], "updatedAt": "same"},
+            {"number": 3, "title": "Changed", "body": "", "labels": [], "updatedAt": "new"},
+        ]
+        store = Mock()
+        store.list_scheduler_queued.return_value = []
+        store.active_issue_numbers.return_value = set()
+        store.scheduler_queue_state.return_value = {}
+        store.get_scheduler_snapshot.return_value = {
+            "candidate_state": {
+                "1": {"updated_at": "same", "open_pr": False},
+                "2": {"updated_at": "same", "open_pr": False},
+                "3": {"updated_at": "old", "open_pr": False},
+            },
+            "queue_state": {},
+            "policy_state": _policy_state(),
+            "decision_state": {
+                "1": {"action": "reject", "score": 0, "reason": "tracking"},
+                "2": {"action": "defer", "score": 20, "reason": "later"},
+                "3": {"action": "reject", "score": 10, "reason": "old"},
+            },
+            "agent_evaluated_at": (
+                datetime.now(timezone.utc) - timedelta(hours=1)
+            ).isoformat(),
+        }
+        agent = Mock()
+        agent.rank.return_value = [
+            SchedulerDecision(2, "defer", 20, "Still later"),
+            SchedulerDecision(3, "reject", 5, "Still unsuitable"),
+        ]
+
+        schedule_once(store, scheduler_agent=agent)
+
+        agent.rank.assert_called_once_with([2, 3])
+        saved = store.save_scheduler_snapshot.call_args.kwargs["decision_state"]
+        self.assertEqual(saved["1"]["reason"], "tracking")
+        self.assertEqual(saved["2"]["reason"], "Still later")
+        self.assertEqual(saved["3"]["reason"], "Still unsuitable")
+
+    @patch("orchestration.scheduler._open_pr_issue_numbers", return_value=set())
+    @patch("orchestration.scheduler._issue_is_open", return_value=False)
+    @patch("orchestration.scheduler._list_open_issues")
+    def test_empty_queue_reassessment_skips_agent_when_all_rejects_are_cached(
+        self, list_issues, issue_is_open, open_pr_issues
+    ):
+        list_issues.return_value = [
+            {"number": 1, "title": "Tracking", "body": "", "labels": [], "updatedAt": "same"},
+        ]
+        store = Mock()
+        store.list_scheduler_queued.return_value = []
+        store.active_issue_numbers.return_value = set()
+        store.scheduler_queue_state.return_value = {}
+        store.get_scheduler_snapshot.return_value = {
+            "candidate_state": {"1": {"updated_at": "same", "open_pr": False}},
+            "queue_state": {},
+            "policy_state": _policy_state(),
+            "decision_state": {
+                "1": {"action": "reject", "score": 0, "reason": "tracking"},
+            },
+            "agent_evaluated_at": (
+                datetime.now(timezone.utc) - timedelta(hours=1)
+            ).isoformat(),
+        }
+        agent = Mock()
+
+        self.assertEqual(schedule_once(store, scheduler_agent=agent), [])
+
+        agent.rank.assert_not_called()
+        self.assertEqual(store.add_event.call_args.args[1], "scheduler_agent_cache_hit")
+
+    @patch("orchestration.scheduler._open_pr_issue_numbers", return_value=set())
+    @patch("orchestration.scheduler._issue_is_open", return_value=False)
+    @patch("orchestration.scheduler._list_open_issues")
     def test_schedule_once_releases_scheduler_queue_blocked_by_safety_filter(
         self, list_issues, issue_is_open, open_pr_issues
     ):

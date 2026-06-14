@@ -251,14 +251,26 @@ class RunStoreTests(unittest.TestCase):
             candidate_state=candidates,
             queue_state=queue_state,
             policy_state={"version": 1},
+            decision_state={"3": {"action": "reject", "score": 5, "reason": "tracking"}},
             agent_evaluated=True,
         )
         snapshot = self.store.get_scheduler_snapshot("owner/repo")
         self.assertEqual(snapshot["candidate_state"], candidates)
         self.assertEqual(snapshot["queue_state"], queue_state)
         self.assertEqual(snapshot["policy_state"], {"version": 1})
+        self.assertEqual(snapshot["decision_state"]["3"]["action"], "reject")
         self.assertIsNotNone(snapshot["agent_evaluated_at"])
         self.assertTrue(snapshot["updated_at"])
+        self.store.save_scheduler_snapshot(
+            "owner/repo",
+            candidate_state=candidates,
+            queue_state={},
+            policy_state={"version": 1},
+        )
+        self.assertEqual(
+            self.store.get_scheduler_snapshot("owner/repo")["decision_state"]["3"]["action"],
+            "reject",
+        )
 
     def test_lists_recent_global_events_without_run_events(self):
         run = self.store.enqueue("owner/repo", 1)

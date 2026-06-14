@@ -2,7 +2,7 @@ import json
 
 from agents.base import log, run_cmd, warn
 from agents.developer import DeveloperAgent
-from config import GITHUB_REPO
+from config import GITHUB_REPO, SUBMISSION_USE_AGENT_METADATA
 from orchestration.errors import NeedsHumanError, NoChangesError
 from orchestration.store import RunRecord, RunStore
 
@@ -146,15 +146,28 @@ def _prepare_submission_metadata(
                 )
                 return metadata
     generated = {}
-    if developer is not None:
+    source = "deterministic"
+    if SUBMISSION_USE_AGENT_METADATA and developer is not None:
         try:
             generated = developer.prepare_submission(
                 record.issue_number,
                 plan=record.plan,
                 resume_session=bool(developer.session_id),
             )
+            source = "agent"
         except Exception as exc:
             warn(f"Task Lead could not generate submission metadata; using fallback: {exc}")
+    elif getattr(record, "plan", None):
+        summary = str(record.plan.get("summary") or "").strip()
+        tests = record.plan.get("test_plan") or []
+        if not isinstance(tests, list):
+            tests = [tests]
+        body_parts = [summary] if summary else []
+        if tests:
+            body_parts.append(
+                "## Tests\n" + "\n".join(f"- {test}" for test in tests)
+            )
+        generated = {"pr_body": "\n\n".join(body_parts)}
     metadata = _normalize_submission_metadata(record, generated)
     if store is not None:
         store.add_event(
@@ -162,8 +175,8 @@ def _prepare_submission_metadata(
             "submission_metadata_prepared",
             stage=record.stage,
             status=record.status,
-            message="Prepared commit and PR metadata",
-            data=metadata,
+            message=f"Prepared {source} commit and PR metadata",
+            data={**metadata, "source": source},
         )
     return metadata
 
