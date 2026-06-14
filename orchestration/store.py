@@ -314,6 +314,19 @@ class RunStore:
                 (run_id, event_type),
             ).fetchone()[0])
 
+    def latest_event(self, run_id: str, event_type: str) -> RunEvent | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM run_events
+                WHERE run_id = ? AND event_type = ?
+                ORDER BY event_id DESC
+                LIMIT 1
+                """,
+                (run_id, event_type),
+            ).fetchone()
+        return self._event(row) if row is not None else None
+
     def create(self, repo: str, issue_number: int, max_parallel: int) -> RunRecord:
         run_id = uuid.uuid4().hex[:12]
         timestamp = _now()

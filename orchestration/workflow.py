@@ -1,3 +1,4 @@
+import hashlib
 import time
 from datetime import datetime, timezone
 
@@ -29,6 +30,7 @@ from orchestration.github_ops import (
     mark_issue_with_skip_label,
     preflight_worker,
     prepare_base_repo,
+    pr_feedback_fingerprint,
     wait_for_pr_checks,
 )
 from orchestration.runtime import runtime
@@ -91,11 +93,56 @@ def run_local_review(
     developer: DeveloperAgent,
     *,
     follow_up: bool = False,
+    record: RunRecord | None = None,
+    store: RunStore | None = None,
 ) -> bool:
     for local_round in range(MAX_LOCAL_REVIEW_ROUNDS):
+        fingerprint = _workspace_fingerprint(
+            record.worktree_path if record is not None else None
+        )
+        cached = (
+            store.latest_event(record.run_id, "local_review_completed")
+            if store is not None and record is not None and fingerprint
+            else None
+        )
+        if cached is not None and cached.data.get("fingerprint") == fingerprint:
+            store.add_event(
+                record.run_id,
+                "local_review_cache_hit",
+                stage=record.stage,
+                status=record.status,
+                message="Reused local review for unchanged workspace",
+                data={
+                    "fingerprint": fingerprint,
+                    "approved": bool(cached.data.get("approved")),
+                },
+            )
+            if cached.data.get("approved"):
+                done("Local Reviewer skipped; unchanged workspace matched approved review")
+                return True
+            cached_findings = cached.data.get("findings")
+            review_comments = cached_findings if isinstance(cached_findings, list) else None
+        else:
+            review_comments = None
         if follow_up:
             step(f"[REVIEW] Local Reviewer follow-up (round {local_round + 1})")
-        review_comments = reviewer.review(issue_number, resume_session=True)
+        if review_comments is None:
+            review_comments = reviewer.review(issue_number, resume_session=True)
+        else:
+            log("Local Reviewer reused cached findings for unchanged workspace")
+        if store is not None and record is not None and fingerprint:
+            store.add_event(
+                record.run_id,
+                "local_review_completed",
+                stage=record.stage,
+                status=record.status,
+                message="Completed local review",
+                data={
+                    "fingerprint": fingerprint,
+                    "approved": not review_comments,
+                    "findings": review_comments,
+                },
+            )
         if not review_comments:
             done("Reviewer approved (LGTM)")
             return True
@@ -112,6 +159,79 @@ def run_local_review(
 
     warn(f"Reached the local review limit ({MAX_LOCAL_REVIEW_ROUNDS}); stopping this run")
     return False
+
+def _workspace_fingerprint(worktree_path: str | None) -> str | None:
+    if not worktree_path:
+        return None
+    head = run_cmd(["git", "rev-parse", "HEAD"], cwd=worktree_path, check=False)
+    status = run_cmd(["git", "status", "--porcelain"], cwd=worktree_path, check=False)
+    diff = run_cmd(["git", "diff", "--binary", "HEAD"], cwd=worktree_path, check=False)
+    untracked = run_cmd(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=worktree_path,
+        check=False,
+    )
+    if any(result.returncode != 0 for result in (head, status, diff, untracked)):
+        return None
+    untracked_files = [line for line in untracked.stdout.splitlines() if line.strip()]
+    hashes = ""
+    if untracked_files:
+        result = run_cmd(
+            ["git", "hash-object", "--", *untracked_files],
+            cwd=worktree_path,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        hashes = result.stdout
+    payload = "\0".join((head.stdout, status.stdout, diff.stdout, untracked.stdout, hashes))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+def _planner_phase(
+    store: RunStore,
+    run_id: str,
+    event_type: str,
+    planning_input: dict,
+) -> dict:
+    event = store.latest_event(run_id, event_type)
+    if event is None or not isinstance(event.data, dict):
+        return {}
+    if event.data.get("planning_input") != planning_input:
+        return {}
+    return event.data
+
+def _save_planner_phase(
+    store: RunStore,
+    record: RunRecord,
+    analyst: AnalystAgent,
+    event_type: str,
+    data: dict,
+    planning_input: dict,
+):
+    store.add_event(
+        record.run_id,
+        event_type,
+        stage="analyzing",
+        status="planning",
+        message=f"Cached Planner phase: {event_type.removeprefix('planner_')}",
+        data={**data, "planning_input": planning_input},
+    )
+    store.update(
+        record.run_id,
+        sessions={"task_lead": analyst.session_id} if analyst.session_id else {},
+        error=None,
+    )
+    store.heartbeat(record.run_id, "planner", PLANNER_LEASE_SECONDS)
+
+def _record_planner_cache_hit(store: RunStore, record: RunRecord, phase: str):
+    store.add_event(
+        record.run_id,
+        "planner_phase_cache_hit",
+        stage="analyzing",
+        status="planning",
+        message=f"Reused cached Planner {phase}",
+        data={"phase": phase},
+    )
 
 def _agents(analyst, developer, reviewer, submitter):
     return (analyst, developer, reviewer, submitter)
@@ -218,31 +338,72 @@ def plan_task(
     )
     try:
         run_step(record, "[PLAN] Task Lead plans issue", started=started)
-        _, analysis = analyst.analyze(
-            target_issue=record.issue_number,
-            resume_session=bool(analyst.session_id),
-        )
-        store.heartbeat(record.run_id, "planner", PLANNER_LEASE_SECONDS)
-        show_analysis(record.issue_number, analysis)
-        impact, risk = analyst.assess_impact(
-            record.issue_number,
-            resume_session=bool(analyst.session_id),
-        )
-        store.heartbeat(record.run_id, "planner", PLANNER_LEASE_SECONDS)
-        plan = analyst.build_plan(
-            record.issue_number,
-            analysis,
-            impact,
-            risk,
-            resume_session=bool(analyst.session_id),
-        )
-        store.heartbeat(record.run_id, "planner", PLANNER_LEASE_SECONDS)
         snapshot = _get_issue_snapshot(record.issue_number) or {}
+        planning_input = {
+            "issue_updated_at": snapshot.get("updatedAt"),
+            "base_sha": _base_sha(),
+        }
+        analysis_cache = _planner_phase(
+            store, record.run_id, "planner_analysis_completed", planning_input
+        )
+        analysis = str(analysis_cache.get("analysis") or "")
+        if not analysis:
+            _, analysis = analyst.analyze(
+                target_issue=record.issue_number,
+                resume_session=bool(analyst.session_id),
+            )
+            _save_planner_phase(
+                store, record, analyst, "planner_analysis_completed",
+                {"analysis": analysis},
+                planning_input,
+            )
+        else:
+            _record_planner_cache_hit(store, record, "analysis")
+            log(f"Planner reused cached analysis for issue #{record.issue_number}")
+        show_analysis(record.issue_number, analysis)
+        impact_cache = _planner_phase(
+            store, record.run_id, "planner_impact_completed", planning_input
+        )
+        impact = str(impact_cache.get("impact") or "")
+        risk = str(impact_cache.get("risk") or "")
+        if not impact or not risk:
+            impact, risk = analyst.assess_impact(
+                record.issue_number,
+                resume_session=bool(analyst.session_id),
+            )
+            _save_planner_phase(
+                store, record, analyst, "planner_impact_completed",
+                {"impact": impact, "risk": risk},
+                planning_input,
+            )
+        else:
+            _record_planner_cache_hit(store, record, "impact")
+            log(f"Planner reused cached impact assessment for issue #{record.issue_number}")
+        plan_cache = _planner_phase(
+            store, record.run_id, "planner_plan_completed", planning_input
+        )
+        plan = plan_cache.get("plan")
+        if not isinstance(plan, dict) or not plan:
+            plan = analyst.build_plan(
+                record.issue_number,
+                analysis,
+                impact,
+                risk,
+                resume_session=bool(analyst.session_id),
+            )
+            _save_planner_phase(
+                store, record, analyst, "planner_plan_completed",
+                {"plan": plan},
+                planning_input,
+            )
+        else:
+            _record_planner_cache_hit(store, record, "plan")
+            log(f"Planner reused cached implementation plan for issue #{record.issue_number}")
         plan.update({
             "issue_number": record.issue_number,
-            "issue_updated_at": snapshot.get("updatedAt"),
+            "issue_updated_at": planning_input["issue_updated_at"],
             "planned_at": datetime.now(timezone.utc).isoformat(),
-            "base_sha": _base_sha(),
+            "base_sha": planning_input["base_sha"],
             "plan_version": 1,
         })
         planned = store.finish_planning(
@@ -437,7 +598,9 @@ def execute_task(
         _check_run_budget(started)
         if record.stage == "reviewing":
             run_step(record, "[REVIEW] Independent local review", started=started)
-            if not run_local_review(record.issue_number, reviewer, developer):
+            if not run_local_review(
+                record.issue_number, reviewer, developer, record=record, store=store
+            ):
                 record = _checkpoint(
                     store, record, analyst, developer, reviewer, submitter,
                     status="needs_human", stage="reviewing",
@@ -516,15 +679,58 @@ def execute_task(
                 f"({review_count + 1}/{MAX_REVIEW_ROUNDS})",
                 started=started,
             )
-            dev_output = developer.apply_review(
-                record.issue_number,
-                record.pr_url,
-                resume_session=True,
-            )
-            if "NO_ACTION_NEEDED" in dev_output.upper():
+            feedback_fingerprint = pr_feedback_fingerprint(record.pr_url)
+            feedback_cache = store.latest_event(record.run_id, "pr_feedback_assessed")
+            if (
+                feedback_fingerprint
+                and feedback_cache is not None
+                and feedback_cache.data.get("fingerprint") == feedback_fingerprint
+            ):
+                action_needed = bool(feedback_cache.data.get("action_needed"))
+                dev_output = str(feedback_cache.data.get("output") or "")
+                store.add_event(
+                    record.run_id,
+                    "pr_feedback_cache_hit",
+                    stage=record.stage,
+                    status=record.status,
+                    message="Reused unchanged PR feedback assessment",
+                    data={
+                        "fingerprint": feedback_fingerprint,
+                        "action_needed": action_needed,
+                    },
+                )
+                log("Task Lead reused cached PR feedback assessment")
+            else:
+                dev_output = developer.apply_review(
+                    record.issue_number,
+                    record.pr_url,
+                    resume_session=True,
+                )
+                action_needed = "NO_ACTION_NEEDED" not in dev_output.upper()
+                if feedback_fingerprint:
+                    store.add_event(
+                        record.run_id,
+                        "pr_feedback_assessed",
+                        stage=record.stage,
+                        status=record.status,
+                        message="Cached PR feedback assessment",
+                        data={
+                            "fingerprint": feedback_fingerprint,
+                            "action_needed": action_needed,
+                            "output": dev_output,
+                        },
+                    )
+            if not action_needed:
                 done("Developer reported no action needed")
                 break
-            if not run_local_review(record.issue_number, reviewer, developer, follow_up=True):
+            if not run_local_review(
+                record.issue_number,
+                reviewer,
+                developer,
+                follow_up=True,
+                record=record,
+                store=store,
+            ):
                 record = _checkpoint(
                     store, record, analyst, developer, reviewer, submitter,
                     status="needs_human", stage="handling_feedback",

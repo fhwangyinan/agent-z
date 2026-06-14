@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -102,6 +103,48 @@ def _get_pr_checks(pr_url: str) -> list[dict] | None:
     except json.JSONDecodeError:
         return None
     return checks if isinstance(checks, list) else None
+
+def _stable_feedback(value):
+    if isinstance(value, dict):
+        return {key: _stable_feedback(item) for key, item in sorted(value.items())}
+    if isinstance(value, list):
+        normalized = [_stable_feedback(item) for item in value]
+        return sorted(
+            normalized,
+            key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")),
+        )
+    return value
+
+def pr_feedback_fingerprint(pr_url: str) -> str | None:
+    checks = _get_pr_checks(pr_url)
+    if checks is None:
+        return None
+    result = run_cmd(
+        [
+            "gh", "pr", "view", pr_url,
+            "--repo", GITHUB_REPO,
+            "--json", "headRefOid,comments,reviews",
+        ],
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return None
+    try:
+        feedback = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    payload = {
+        "checks": sorted(
+            (
+                {"name": str(check.get("name") or ""), "bucket": str(check.get("bucket") or "")}
+                for check in checks
+            ),
+            key=lambda check: (check["name"], check["bucket"]),
+        ),
+        "feedback": _stable_feedback(feedback),
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 def wait_for_pr_checks(pr_url: str, record: RunRecord | None = None) -> bool:
     started = time.monotonic()

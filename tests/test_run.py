@@ -1,6 +1,8 @@
 import subprocess
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -10,6 +12,8 @@ import orchestration.errors
 import orchestration.pools
 import orchestration.submission
 import orchestration.tui
+import orchestration.workflow
+from orchestration.store import RunStore
 
 
 def result(returncode=0, stdout="", stderr=""):
@@ -182,6 +186,60 @@ class LocalReviewTests(QuietRunTest):
             developer.apply_review.call_args.kwargs["review_comments"],
             ["still broken"],
         )
+
+    @patch("orchestration.workflow._workspace_fingerprint", return_value="same")
+    def test_approved_local_review_is_reused_for_unchanged_workspace(self, fingerprint):
+        reviewer = Mock()
+        developer = Mock()
+        record = SimpleNamespace(
+            run_id="run-1", worktree_path="worktree", stage="reviewing", status="running"
+        )
+        store = Mock()
+        store.latest_event.return_value = SimpleNamespace(
+            data={"fingerprint": "same", "approved": True}
+        )
+
+        self.assertTrue(run.run_local_review(
+            1, reviewer, developer, record=record, store=store
+        ))
+
+        reviewer.review.assert_not_called()
+
+    @patch("orchestration.workflow._workspace_fingerprint", return_value="same")
+    def test_local_review_findings_are_reused_for_unchanged_workspace(self, fingerprint):
+        reviewer = Mock()
+        developer = Mock()
+        record = SimpleNamespace(
+            run_id="run-1", worktree_path="worktree", stage="reviewing", status="running"
+        )
+        store = Mock()
+        store.latest_event.return_value = SimpleNamespace(
+            data={"fingerprint": "same", "approved": False, "findings": ["fix this"]}
+        )
+        with patch("orchestration.workflow.MAX_LOCAL_REVIEW_ROUNDS", 1):
+            self.assertFalse(run.run_local_review(
+                1, reviewer, developer, record=record, store=store
+            ))
+        reviewer.review.assert_not_called()
+        self.assertEqual(
+            developer.apply_review.call_args.kwargs["review_comments"], ["fix this"]
+        )
+
+
+class FeedbackFingerprintTests(QuietRunTest):
+    @patch("orchestration.github_ops.run_cmd")
+    def test_pr_feedback_fingerprint_ignores_api_list_order(self, run_cmd):
+        run_cmd.side_effect = [
+            result(stdout='[{"name":"B","bucket":"pass"},{"name":"A","bucket":"fail"}]'),
+            result(stdout='{"headRefOid":"abc","comments":[{"body":"two"},{"body":"one"}],"reviews":[]}'),
+            result(stdout='[{"name":"A","bucket":"fail"},{"name":"B","bucket":"pass"}]'),
+            result(stdout='{"reviews":[],"comments":[{"body":"one"},{"body":"two"}],"headRefOid":"abc"}'),
+        ]
+
+        first = orchestration.github_ops.pr_feedback_fingerprint("https://example/pr/1")
+        second = orchestration.github_ops.pr_feedback_fingerprint("https://example/pr/1")
+
+        self.assertEqual(first, second)
 
 
 class SkipLabelTests(QuietRunTest):
@@ -1014,6 +1072,52 @@ class WorkerTests(QuietRunTest):
 
 
 class PlannerTests(QuietRunTest):
+    def test_planner_phase_cache_is_invalidated_when_input_changes(self):
+        store = Mock()
+        store.latest_event.return_value = SimpleNamespace(
+            data={
+                "analysis": "old",
+                "planning_input": {"issue_updated_at": "old", "base_sha": "base"},
+            }
+        )
+        self.assertEqual(
+            orchestration.workflow._planner_phase(
+                store,
+                "run-1",
+                "planner_analysis_completed",
+                {"issue_updated_at": "new", "base_sha": "base"},
+            ),
+            {},
+        )
+
+    @patch("orchestration.workflow._base_sha", return_value="base")
+    @patch(
+        "orchestration.workflow._get_issue_snapshot",
+        return_value={"updatedAt": "2026-01-01T00:00:00Z"},
+    )
+    def test_planner_retry_reuses_completed_phases(self, issue_snapshot, base_sha):
+        with tempfile.TemporaryDirectory() as temp:
+            store = RunStore(Path(temp) / "state.db")
+            queued = store.enqueue("owner/repo", 7)
+            record = store.claim_for_planning(60, queued.run_id)
+            analyst = Mock(session_id=None)
+            analyst.reset_session.side_effect = lambda: setattr(analyst, "session_id", None)
+            analyst.analyze.return_value = (7, "analysis")
+            analyst.assess_impact.return_value = ("impact", "low")
+            analyst.build_plan.side_effect = [
+                RuntimeError("network timeout"),
+                {"summary": "plan", "predicted_files": [], "acceptance_criteria": []},
+            ]
+
+            with self.assertRaisesRegex(RuntimeError, "network timeout"):
+                run.plan_task(record, store, analyst, fail_on_error=False)
+            planned = run.plan_task(store.get(record.run_id), store, analyst, fail_on_error=False)
+
+            self.assertEqual(planned.status, "ready")
+            analyst.analyze.assert_called_once()
+            analyst.assess_impact.assert_called_once()
+            self.assertEqual(analyst.build_plan.call_count, 2)
+
     @patch("orchestration.pools.PLANNER_RETRY_BASE_DELAY", 1)
     @patch("orchestration.pools.wait_with_status")
     @patch("orchestration.pools.plan_task", side_effect=RuntimeError("network timeout"))

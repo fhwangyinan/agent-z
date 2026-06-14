@@ -288,6 +288,14 @@ class RunStoreTests(unittest.TestCase):
             2,
         )
 
+    def test_returns_latest_event_by_type(self):
+        run = self.store.enqueue("owner/repo", 1)
+        self.store.add_event(run.run_id, "phase", data={"value": 1})
+        self.store.add_event(run.run_id, "other", data={"value": 2})
+        self.store.add_event(run.run_id, "phase", data={"value": 3})
+        self.assertEqual(self.store.latest_event(run.run_id, "phase").data["value"], 3)
+        self.assertIsNone(self.store.latest_event(run.run_id, "missing"))
+
     @patch("orchestration.store._pid_alive", return_value=True)
     def test_resume_rejects_run_owned_by_another_live_process(self, pid_alive):
         record = self.store.create("owner/repo", 1, max_parallel=1)
