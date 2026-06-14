@@ -14,11 +14,12 @@ class AnalystPromptTests(unittest.TestCase):
             issue_number, _ = analyst.analyze()
             self.assertEqual(issue_number, 5)
             prompt = run_agent.call_args.args[0]
-            self.assertIn("exclude issues with any of these labels", prompt.lower())
-            self.assertIn("`ongoing`", prompt)
-            self.assertIn("`blocked`", prompt)
+            self.assertIn("exclude issues with any configured skip label", prompt.lower())
+            self.assertIn('"ongoing"', prompt)
+            self.assertIn('"blocked"', prompt)
             self.assertIn("Explore open issues and open PRs as needed", prompt)
             self.assertIn("Avoid loading the full open backlog", prompt)
+            self.assertGreater(prompt.index('"ongoing"'), prompt.index("TASK CONTEXT"))
 
     @patch("agents.base.done")
     @patch("agents.base.agent_status")

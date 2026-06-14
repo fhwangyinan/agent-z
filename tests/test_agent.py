@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from agents.base import Agent
+from agents.base import Agent, prompt_with_context
 from agents.runners.base import AgentResult, BackendCapabilities
 from orchestration.errors import WorkspaceIsolationError
 
@@ -29,6 +29,15 @@ class FakeRunner:
 
 
 class AgentSessionTests(unittest.TestCase):
+    def test_prompt_context_keeps_variable_values_after_stable_instructions(self):
+        first = prompt_with_context("Stable instructions.", issue_number=1)
+        second = prompt_with_context("Stable instructions.", issue_number=2)
+        self.assertEqual(
+            first.split("TASK CONTEXT", 1)[0],
+            second.split("TASK CONTEXT", 1)[0],
+        )
+        self.assertGreater(first.index('"issue_number"'), first.index("TASK CONTEXT"))
+
     @patch("agents.base.done")
     @patch("agents.base.agent_status")
     def test_each_agent_owns_an_independent_session(self, status, done):
@@ -88,6 +97,7 @@ class AgentWorkspaceIsolationTests(unittest.TestCase):
         self.assertIn("WORKSPACE BOUNDARY", output)
         self.assertIn(str(self.worktree.resolve()), output)
         self.assertIn("Stay on task branch: agent-z/1-run", output)
+        self.assertLess(output.index("Fix it"), output.index(str(self.worktree.resolve())))
 
     @patch("agents.base.done")
     @patch("agents.base.agent_status")

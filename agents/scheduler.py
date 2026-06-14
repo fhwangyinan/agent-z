@@ -10,7 +10,7 @@ from config import (
     TIMEOUT_ANALYST,
 )
 
-from .base import Agent
+from .base import Agent, prompt_with_context
 
 
 @dataclass(frozen=True)
@@ -27,11 +27,9 @@ class SchedulerAgent(Agent):
 
     def rank(self, issue_numbers: list[int]) -> list[SchedulerDecision]:
         issue_numbers = [int(number) for number in issue_numbers]
-        prompt = (
-            f"You are the scheduling lead for {GITHUB_REPO}. Select at most "
-            f"{SCHEDULER_BATCH_SIZE} issues that an autonomous coding agent should work on next. "
-            f"The project checkout is {PROJECT_DIR}. Candidate issue numbers: "
-            f"{', '.join(f'#{number}' for number in issue_numbers)}. Inspect every candidate yourself "
+        prompt = prompt_with_context(
+            "You are the scheduling lead. Select at most the configured batch size of issues that an "
+            "autonomous coding agent should work on next. Inspect every candidate yourself "
             "with gh, including its current body, labels, references, related open PRs, and directly "
             "relevant code. Do not modify code, issues, labels, assignees, or PRs.\n\n"
             "Only enqueue issues that describe a concrete, independently deliverable implementation "
@@ -50,22 +48,27 @@ class SchedulerAgent(Agent):
             "(integer 0-100), and reason (short string). Use enqueue only for the best issues, "
             "defer for actionable work that should be reconsidered in a later scan, and reject only "
             "for work that is not independently actionable. Order decisions from highest to lowest "
-            "score. Never introduce an issue number outside the candidate list."
+            "score. Never introduce an issue number outside the candidate list.",
+            github_repository=GITHUB_REPO,
+            project_checkout=PROJECT_DIR,
+            scheduler_batch_size=SCHEDULER_BATCH_SIZE,
+            candidate_issue_numbers=issue_numbers,
         )
         output = self.run(prompt, timeout=TIMEOUT_ANALYST)
         try:
             return parse_scheduler_decisions(output, set(issue_numbers))
         except RuntimeError as exc:
-            correction = (
-                f"Your previous scheduler response could not be parsed: {exc}. "
+            correction = prompt_with_context(
+                "Your previous scheduler response could not be parsed. "
                 "Return only the required structured decision object now. Include exactly one "
-                "decision for every candidate issue number: "
-                f"{', '.join(f'#{number}' for number in issue_numbers)}. "
-                "Do not omit candidates or add new issue numbers.\n\n"
+                "decision for every candidate issue number. Do not omit candidates or add new issue "
+                "numbers.\n\n"
                 "SCHEDULER_JSON_START\n"
                 '{"decisions":[{"issue_number":123,"action":"enqueue|defer|reject",'
                 '"score":0,"reason":"short reason"}]}\n'
-                "SCHEDULER_JSON_END"
+                "SCHEDULER_JSON_END",
+                parse_error=str(exc),
+                candidate_issue_numbers=issue_numbers,
             )
             output = self.run(
                 correction,

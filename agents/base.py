@@ -1,4 +1,5 @@
 import re
+import json
 import os
 import subprocess
 import sys
@@ -53,6 +54,21 @@ AGENT_COLORS = {
     "Developer": "green",
     "Reviewer":  "magenta",
 }
+
+def prompt_with_context(instructions: str, **context) -> str:
+    """Keep reusable instructions before variable task context for provider prefix caches."""
+    values = {
+        key: value
+        for key, value in context.items()
+        if value is not None and value != ""
+    }
+    if not values:
+        return instructions.strip()
+    return (
+        f"{instructions.strip()}\n\n"
+        "TASK CONTEXT (variable; use only for this request):\n"
+        f"{json.dumps(values, ensure_ascii=True, sort_keys=True, indent=2)}"
+    )
 
 
 def log(msg: str):
@@ -302,13 +318,14 @@ class Agent:
         workspace = Path(self.cwd).resolve()
         return (
             "WORKSPACE BOUNDARY (mandatory):\n"
-            f"- Work only inside this task worktree: {workspace}\n"
-            f"- Stay on task branch: {branch}\n"
             "- Never edit, commit, switch branches, or run git commands in the main checkout "
             "or another worktree.\n"
             "- Do not use cd or git -C to operate outside this task worktree.\n"
             "- Push or create a PR only when the task explicitly asks for it.\n\n"
-            f"{prompt}"
+            f"{prompt}\n\n"
+            "WORKSPACE CONTEXT (variable; mandatory):\n"
+            f"- Work only inside this task worktree: {workspace}\n"
+            f"- Stay on task branch: {branch}"
         )
 
     def _verify_workspace_guard(self, guard: tuple[str, str] | None):

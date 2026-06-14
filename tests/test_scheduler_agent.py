@@ -43,8 +43,30 @@ class SchedulerAgentTests(unittest.TestCase):
         self.assertIn("tracking/meta issues", prompt)
         self.assertIn("independently deliverable implementation task", prompt)
         self.assertIn("labels are hints, not truth", prompt)
-        self.assertIn("candidate issue numbers: #1", prompt)
+        self.assertIn('"candidate_issue_numbers"', prompt)
         self.assertIn("inspect every candidate yourself with gh", prompt)
+        self.assertGreater(prompt.index('"candidate_issue_numbers"'), prompt.index("task context"))
+
+    @patch("agents.scheduler.SchedulerAgent.run")
+    def test_variable_candidates_do_not_change_scheduler_prompt_prefix(self, run):
+        run.return_value = (
+            'SCHEDULER_JSON_START {"decisions": ['
+            '{"issue_number": 1, "action": "reject", "score": 0, "reason": "Tracking issue"}'
+            "]} SCHEDULER_JSON_END"
+        )
+        SchedulerAgent().rank([1])
+        first = run.call_args.args[0]
+        run.return_value = (
+            'SCHEDULER_JSON_START {"decisions": ['
+            '{"issue_number": 2, "action": "reject", "score": 0, "reason": "Tracking issue"}'
+            "]} SCHEDULER_JSON_END"
+        )
+        SchedulerAgent().rank([2])
+        second = run.call_args.args[0]
+        self.assertEqual(
+            first.split("TASK CONTEXT", 1)[0],
+            second.split("TASK CONTEXT", 1)[0],
+        )
 
     @patch("agents.scheduler.SchedulerAgent.run")
     def test_issues_are_reconsidered_each_scan(self, run):

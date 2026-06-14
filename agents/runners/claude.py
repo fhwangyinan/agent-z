@@ -20,6 +20,13 @@ class ClaudeRunner(AgentRunner):
     def __init__(self, flags: list[str] | None = None, retry_timeout: int = 3600):
         self.command = shutil.which("claude") or "claude"
         self.flags = flags if flags is not None else ["--dangerously-skip-permissions"]
+        cache_flag = "--exclude-dynamic-system-prompt-sections"
+        custom_system_prompt = any(
+            flag in {"--system-prompt", "--system-prompt-file"}
+            for flag in self.flags
+        )
+        if cache_flag not in self.flags and not custom_system_prompt:
+            self.flags = [*self.flags, cache_flag]
         self.retry_timeout = retry_timeout
 
     def _run(self, args: list[str], prompt: str, cwd: str, timeout: int):

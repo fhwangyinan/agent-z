@@ -15,6 +15,14 @@ def result(returncode=0, stdout="", stderr=""):
 
 
 class ClaudeRunnerTests(unittest.TestCase):
+    def test_enables_cross_request_prompt_cache_optimization(self):
+        runner = ClaudeRunner(flags=["--dangerously-skip-permissions"])
+        self.assertIn("--exclude-dynamic-system-prompt-sections", runner.flags)
+
+    def test_does_not_add_dynamic_exclusion_with_custom_system_prompt(self):
+        runner = ClaudeRunner(flags=["--system-prompt", "custom"])
+        self.assertNotIn("--exclude-dynamic-system-prompt-sections", runner.flags)
+
     def test_success_returns_explicit_session(self):
         runner = ClaudeRunner(flags=["--flag"])
         payload = json.dumps({"result": "ok", "session_id": "session-1"})
